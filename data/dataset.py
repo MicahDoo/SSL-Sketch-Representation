@@ -121,7 +121,7 @@ class SketchDataset(Dataset):
         for i in range(processed_vector_sequence_np.shape[0]):
             dx, dy, p_down, p_up, p_eos = processed_vector_sequence_np[i]
             next_abs_x, next_abs_y = current_abs_x + dx, current_abs_y + dy
-            if p_down > 0.5: 
+            if i > 0 and p_down > 0.5: 
                 temp_abs_points_segments.append(
                     ((current_abs_x, current_abs_y), (next_abs_x, next_abs_y))
                 )
