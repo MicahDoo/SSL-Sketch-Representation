@@ -1,0 +1,8 @@
+matplotlib
+numpy
+Pillow
+Requests
+torch
+torchvision
+tqdm
+ipython # For IPython.display in test_dataset_quickdraw.py

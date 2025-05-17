@@ -1,3 +1,4 @@
+# data/preprocess_dataset_quickdraw.py
 import os
 import json
 import random
@@ -5,228 +6,278 @@ import argparse
 import numpy as np
 import requests
 from tqdm import tqdm
+from PIL import Image, ImageDraw 
 
 # --- Configuration ---
 BASE_DOWNLOAD_URL = "https://storage.googleapis.com/quickdraw_dataset/full/simplified/"
+CATEGORIES_LIST_URL = "https://raw.githubusercontent.com/googlecreativelab/quickdraw-dataset/master/categories.txt"
 DEFAULT_CATEGORIES = [
     "cat", "dog", "apple", "car", "tree", "house", "bicycle", "bird", "face", "airplane"
 ]
+FALLBACK_CATEGORIES = DEFAULT_CATEGORIES
 
-RAW_DOWNLOAD_DIR_ROOT = os.path.join("..", "downloaded_data")
-PROCESSED_DATA_DIR_ROOT = os.path.join("..", "processed_data")
+# Get the directory where this script file is located
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Define paths relative to the script's directory
+# These will point to directories one level above the script's directory
+# e.g., if script is in 'project/data/', these will be 'project/downloaded_data/'
+RAW_DOWNLOAD_DIR_ROOT = os.path.join(SCRIPT_DIR, "..", "downloaded_data")
+PROCESSED_DATA_DIR_ROOT = os.path.join(SCRIPT_DIR, "..", "processed_data") 
 
 TRAIN_RATIO = 0.80
-VAL_RATIO = 0.10
+VAL_RATIO = 0.10 
+RASTER_IMG_SIZE = 224 
 
-CONFIG_FILENAME = "quickdraw_config.json"
+CONFIG_FILENAME = "quickdraw_config.json" # Name of the config file
+
+# --- Helper Functions --- 
+def download_all_categories_list(url=CATEGORIES_LIST_URL):
+    print(f"Attempting to download category list from {url}...")
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        categories = [line.strip() for line in response.text.split('\n') if line.strip()]
+        if categories:
+            print(f"Successfully downloaded {len(categories)} category names.")
+            return sorted(categories)
+        else:
+            print("Downloaded category list is empty."); return None
+    except requests.exceptions.RequestException as e:
+        print(f"Error downloading category list: {e}"); return None
 
 def download_category_file(category_name, target_dir):
-    """Download a QuickDraw simplified .ndjson file if it doesn't exist."""
+    url_category_name = category_name.replace(" ", "%20")
     raw_cat_dir = os.path.join(target_dir, "quickdraw_raw")
     os.makedirs(raw_cat_dir, exist_ok=True)
-    
     file_name = f"{category_name}.ndjson"
-    url = f"{BASE_DOWNLOAD_URL}{file_name}"
+    url = f"{BASE_DOWNLOAD_URL}{url_category_name}.ndjson"
     target_path = os.path.join(raw_cat_dir, file_name)
-
-    if os.path.exists(target_path):
-        print(f"File '{file_name}' already exists in '{raw_cat_dir}'. Skipping download.")
-        return target_path, True
-
-    print(f"Downloading '{file_name}' from '{url}'...")
+    if os.path.exists(target_path): return target_path, True
     try:
         response = requests.get(url, stream=True)
         response.raise_for_status()
         with open(target_path, 'wb') as f, tqdm(
-            desc=file_name, total=int(response.headers.get('content-length', 0)),
-            unit='iB', unit_scale=True, unit_divisor=1024,
+            desc=f"Downloading {category_name[:20]}...",
+            total=int(response.headers.get('content-length', 0)),
+            unit='iB', unit_scale=True, unit_divisor=1024, leave=False
         ) as bar:
             for chunk in response.iter_content(chunk_size=4096):
-                if not chunk:
-                    continue
-                f.write(chunk)
-                bar.update(len(chunk))
-        print(f"Successfully downloaded '{file_name}' to '{raw_cat_dir}'.")
+                if chunk: f.write(chunk); bar.update(len(chunk))
         return target_path, True
-    except requests.exceptions.RequestException as e:
-        print(f"Error downloading {url}: {e}")
-        if os.path.exists(target_path):
-            os.remove(target_path)
+    except requests.exceptions.RequestException:
+        if os.path.exists(target_path): os.remove(target_path)
         return target_path, False
 
-def load_simplified_drawings(ndjson_path, max_items=None):
-    """
-    Reads a .ndjson file and returns a list of drawings,
-    where each drawing is a list of strokes [[xs],[ys],…].
-    """
+def load_simplified_drawings(ndjson_path, max_items_per_category=None):
     drawings = []
-    with open(ndjson_path, 'r') as f:
-        for i, line in enumerate(f):
-            if max_items is not None and i >= max_items:
-                break
-            try:
-                obj = json.loads(line)
-                drawings.append(obj['drawing'])
-            except json.JSONDecodeError:
-                continue
+    try:
+        with open(ndjson_path, 'r', encoding='utf-8') as f:
+            for i, line in enumerate(f):
+                if max_items_per_category is not None and i >= max_items_per_category: break
+                try:
+                    obj = json.loads(line)
+                    if obj.get('recognized', False): drawings.append(obj['drawing'])
+                except (json.JSONDecodeError, KeyError): pass
+    except Exception as e: print(f"Error reading file {ndjson_path}: {e}")
     return drawings
 
 def convert_raw_sketch_to_delta_sequence(raw_sketch_strokes):
-    """
-    Converts a QuickDraw sketch (list of strokes) to a
-    (dx, dy, p0, p1, p2) sequence.
-    p0: pen_down (stroke continues)
-    p1: pen_up (end of a stroke)
-    p2: end_of_sketch
-    Returns np.ndarray of shape (num_points, 5), dtype=float32.
-    """
     points = []
     last_x, last_y = 0, 0
     num_strokes = len(raw_sketch_strokes)
-    if num_strokes == 0:
-        return np.zeros((0,5), dtype=np.float32)
-
+    if num_strokes == 0: return np.zeros((0,5), dtype=np.float32)
     for stroke_idx, stroke in enumerate(raw_sketch_strokes):
         xs, ys = stroke
-        if not xs:
-            continue
-
-        # Pen-up move to start of this stroke (except first stroke)
-        dx0 = xs[0] - last_x
-        dy0 = ys[0] - last_y
-        if stroke_idx > 0:
-            points.append([dx0, dy0, 0, 1, 0])
-            dx0, dy0 = 0, 0  # reset delta for the first drawing point
-
-        # First point of stroke
-        is_last_point = (stroke_idx == num_strokes - 1) and (len(xs) == 1)
-        p_state = [0,0,1] if is_last_point else [1,0,0]
+        if not xs or len(xs) != len(ys): continue 
+        dx0 = xs[0] - last_x; dy0 = ys[0] - last_y
+        if stroke_idx > 0: points.append([dx0, dy0, 0, 1, 0]); dx0, dy0 = 0, 0
+        is_last_point_in_sketch = (stroke_idx == num_strokes - 1) and (len(xs) == 1)
+        p_state = [0,0,1] if is_last_point_in_sketch else [1,0,0]
         points.append([dx0, dy0] + p_state)
         last_x, last_y = xs[0], ys[0]
-
-        # Remaining points
         for i in range(1, len(xs)):
-            dx = xs[i] - last_x
-            dy = ys[i] - last_y
+            dx = xs[i] - last_x; dy = ys[i] - last_y
             last_x, last_y = xs[i], ys[i]
-            is_last_point = (stroke_idx == num_strokes - 1) and (i == len(xs) - 1)
-            p_state = [0,0,1] if is_last_point else [1,0,0]
+            is_last_point_in_sketch = (stroke_idx == num_strokes - 1) and (i == len(xs) - 1)
+            p_state = [0,0,1] if is_last_point_in_sketch else [1,0,0]
             points.append([dx, dy] + p_state)
-
+        if stroke_idx < num_strokes - 1:
+            if points and points[-1][4] == 0: 
+                points[-1][2] = 0; points[-1][3] = 1
+    if points: 
+        points[-1][2] = 0; points[-1][3] = 0; points[-1][4] = 1 
     return np.array(points, dtype=np.float32)
 
-def main(categories, raw_dir, processed_dir, train_r, val_r):
-    print("--- Starting QuickDraw Preprocessing (Vector mode) ---")
+def rasterize_sequence_to_pil_image(normalized_vector_sequence_np, image_size, line_thickness_raster=2, padding_percent_raster=0.02):
+    image = Image.new("L", (image_size, image_size), "white") 
+    draw = ImageDraw.Draw(image)
+    abs_segments = [] 
+    current_abs_x, current_abs_y = 0.0, 0.0
+    for i in range(normalized_vector_sequence_np.shape[0]):
+        dx, dy, p_down, p_up, p_eos = normalized_vector_sequence_np[i]
+        next_abs_x, next_abs_y = current_abs_x + dx, current_abs_y + dy
+        if p_down > 0.5:
+             if i > 0 : 
+                 abs_segments.append(((current_abs_x, current_abs_y), (next_abs_x, next_abs_y)))
+        current_abs_x, current_abs_y = next_abs_x, next_abs_y
+        if p_eos > 0.5: break
+    if not abs_segments: return image.convert("1")
+    all_x_coords = [p[0][0] for p in abs_segments] + [p[1][0] for p in abs_segments]
+    all_y_coords = [p[0][1] for p in abs_segments] + [p[1][1] for p in abs_segments]
+    if not all_x_coords or not all_y_coords: return image.convert("1")
+    min_x, max_x = min(all_x_coords), max(all_x_coords)
+    min_y, max_y = min(all_y_coords), max(all_y_coords)
+    sketch_width = max_x - min_x; sketch_height = max_y - min_y
+    if sketch_width < 1e-6 and sketch_height < 1e-6: 
+        if abs_segments:
+             pt_x = (abs_segments[0][0][0] - min_x); pt_y = (abs_segments[0][0][1] - min_y) 
+             draw_x = image_size / 2 + pt_x; draw_y = image_size / 2 + pt_y
+             draw.ellipse([(draw_x-1, draw_y-1), (draw_x+1, draw_y+1)], fill="black")
+        return image.convert("1")
+    canvas_draw_area_width = image_size * (1 - 2 * padding_percent_raster)
+    canvas_draw_area_height = image_size * (1 - 2 * padding_percent_raster)
+    scale_factor = 1.0
+    if sketch_width > 1e-6: scale_factor = canvas_draw_area_width / sketch_width
+    if sketch_height > 1e-6: scale_factor = min(scale_factor, canvas_draw_area_height / sketch_height)
+    offset_x_canvas = (image_size - (sketch_width * scale_factor)) / 2.0
+    offset_y_canvas = (image_size - (sketch_height * scale_factor)) / 2.0
+    for p1_abs, p2_abs in abs_segments:
+        x1 = ((p1_abs[0] - min_x) * scale_factor) + offset_x_canvas
+        y1 = ((p1_abs[1] - min_y) * scale_factor) + offset_y_canvas
+        x2 = ((p2_abs[0] - min_x) * scale_factor) + offset_x_canvas
+        y2 = ((p2_abs[1] - min_y) * scale_factor) + offset_y_canvas
+        draw.line([(x1, y1), (x2, y2)], fill="black", width=line_thickness_raster)
+    del draw
+    return image.convert("1")
 
-    # Prepare directories
-    proc_base = os.path.join(processed_dir, "quickdraw")
-    os.makedirs(proc_base, exist_ok=True)
+def main(categories_to_process, raw_dir_param, processed_dir_base_param, train_r, val_r, max_items_cat): # Renamed params to avoid conflict
+    print(f"--- Starting QuickDraw Preprocessing for {len(categories_to_process)} categories ---")
+    if max_items_cat: print(f"Max items per category: {max_items_cat}.")
+
+    vector_proc_base = os.path.join(processed_dir_base_param, "quickdraw_vector")
+    raster_proc_base = os.path.join(processed_dir_base_param, "quickdraw_raster")
+    
+    os.makedirs(vector_proc_base, exist_ok=True)
+    os.makedirs(raster_proc_base, exist_ok=True)
     for split in ("train", "val", "test"):
-        os.makedirs(os.path.join(proc_base, split), exist_ok=True)
+        os.makedirs(os.path.join(vector_proc_base, split), exist_ok=True)
+        os.makedirs(os.path.join(raster_proc_base, split), exist_ok=True)
+        for cat_name in categories_to_process:
+             os.makedirs(os.path.join(raster_proc_base, split, cat_name), exist_ok=True)
 
-    # Download & load all sketches, then split
-    all_splits = {"train": [], "val": [], "test": []}
+    all_sketches_by_cat = {}
     category_map = {}
-    categories = sorted(categories)
+        
+    for idx, cat_name in enumerate(tqdm(categories_to_process, desc="Downloading & Loading Categories")):
+        category_map[cat_name] = idx
+        ndjson_path, ok = download_category_file(cat_name, raw_dir_param) # Use param
+        if not ok: print(f"  -> Skipping '{cat_name}' (download/find failed)."); continue
+        drawings = load_simplified_drawings(ndjson_path, max_items_per_category=max_items_cat)
+        if drawings: all_sketches_by_cat[cat_name] = drawings
+        else: print(f"  -> No drawings for '{cat_name}'.")
 
-    for idx, cat in enumerate(categories):
-        print(f"\nProcessing category '{cat}' ({idx+1}/{len(categories)})")
-        category_map[cat] = idx
+    print("\n--- Pass 1: Converting & Calculating StdDev ---")
+    all_train_candidate_deltas = []
+    all_processed_sketches_by_cat = {}
+    for cat_name, raw_drawings in tqdm(all_sketches_by_cat.items(), desc="Pass 1 Processing"):
+        processed_sequences_for_cat = [seq for sketch_drawing in raw_drawings 
+                                       if (seq := convert_raw_sketch_to_delta_sequence(sketch_drawing)).size > 0]
+        if not processed_sequences_for_cat: print(f"No valid sequences for '{cat_name}'."); continue
+        all_processed_sketches_by_cat[cat_name] = processed_sequences_for_cat
+        random.shuffle(processed_sequences_for_cat)
+        n_train_cat = int(train_r * len(processed_sequences_for_cat))
+        for seq_array in processed_sequences_for_cat[:n_train_cat]:
+            all_train_candidate_deltas.extend(seq_array[:,0]); all_train_candidate_deltas.extend(seq_array[:,1])
 
-        ndjson_path, ok = download_category_file(cat, raw_dir)
-        if not ok:
-            print(f"  → Failed to download '{cat}', skipping.")
-            continue
+    if not all_train_candidate_deltas: std_dev = 1.0; print("Warning: No deltas; std_dev=1.0")
+    else: std_dev = float(np.std(all_train_candidate_deltas)); std_dev = max(std_dev, 1e-6) 
+    print(f"Global std_dev = {std_dev:.4f}")
 
-        drawings = load_simplified_drawings(ndjson_path)
-        random.shuffle(drawings)
-        n = len(drawings)
-        n_train = int(train_r * n)
-        n_val   = int(val_r   * n)
-
-        all_splits["train"].extend((cat, d) for d in drawings[:n_train])
-        all_splits["val"].extend(  (cat, d) for d in drawings[n_train:n_train+n_val])
-        all_splits["test"].extend( (cat, d) for d in drawings[n_train+n_val:])
-
-    # Pass 1: compute std_dev from train deltas
-    print("\n--- Pass 1: computing global std_dev ---")
-    all_deltas = []
-    for cat, sketch in all_splits["train"]:
-        seq = convert_raw_sketch_to_delta_sequence(sketch)
-        if seq.size:
-            all_deltas.extend(seq[:,0].tolist())
-            all_deltas.extend(seq[:,1].tolist())
-
-    if not all_deltas:
-        std_dev = 1.0
-        print("No deltas found; defaulting std_dev=1.0")
-    else:
-        std_dev = float(np.std(all_deltas))
-        if std_dev < 1e-6:
-            std_dev = 1.0
-        print(f"Computed std_dev = {std_dev:.4f}")
-
-    # Pass 2: normalize, save by split/category
-    print("\n--- Pass 2: normalizing & saving ---")
-    for split, items in all_splits.items():
-        by_cat = {}
-        for cat, sketch in items:
-            seq = convert_raw_sketch_to_delta_sequence(sketch)
-            if seq.size == 0:
-                continue
-            seq[:,:2] /= std_dev
-            by_cat.setdefault(cat, []).append(seq)
-
-        for cat, seqs in by_cat.items():
-            out_path = os.path.join(proc_base, split, f"{cat}.npy")
-            np.save(out_path, np.array(seqs, dtype=object))
-            print(f" Saved {len(seqs)} sketches for '{cat}' → {split}")
-
-    # Save config
-    cfg = {
-        "quickdraw_std_dev": std_dev,
-        "category_map": category_map,
-        "categories": categories,
-        "train_ratio": train_r,
-        "val_ratio": val_r,
-        "note": mode: dx,dy,p-states normalized, split by category"
+    print("\n--- Pass 2: Normalizing, Rasterizing, Splitting, Saving ---")
+    for cat_name, processed_sequences in tqdm(all_processed_sketches_by_cat.items(), desc="Pass 2 Processing"):
+        normalized_vector_sequences = []
+        raster_images_for_cat = []
+        for seq_array in processed_sequences:
+            norm_seq = seq_array.copy(); norm_seq[:, :2] /= std_dev 
+            normalized_vector_sequences.append(norm_seq)
+            pil_img = rasterize_sequence_to_pil_image(norm_seq, RASTER_IMG_SIZE)
+            raster_images_for_cat.append(pil_img)
+        combined = list(zip(normalized_vector_sequences, raster_images_for_cat))
+        random.shuffle(combined)
+        shuffled_vectors, shuffled_rasters = zip(*combined) if combined else ([], [])
+        n_total = len(shuffled_vectors)
+        n_train = int(train_r * n_total); n_val = int(val_r * n_total)
+        splits_vector = {"train": list(shuffled_vectors[:n_train]), "val": list(shuffled_vectors[n_train : n_train + n_val]), "test": list(shuffled_vectors[n_train + n_val:])}
+        splits_raster = {"train": list(shuffled_rasters[:n_train]), "val": list(shuffled_rasters[n_train : n_train + n_val]), "test": list(shuffled_rasters[n_train + n_val:])}
+        for split_name in ["train", "val", "test"]:
+            vector_split_data = splits_vector[split_name]; raster_split_data = splits_raster[split_name]
+            if not vector_split_data: continue
+            vector_out_path = os.path.join(vector_proc_base, split_name, f"{cat_name}.npy")
+            np.save(vector_out_path, np.array(vector_split_data, dtype=object))
+            raster_cat_split_dir = os.path.join(raster_proc_base, split_name, cat_name)
+            for i, pil_img in enumerate(raster_split_data):
+                img_filename = f"sketch_{i:05d}.png"
+                pil_img.save(os.path.join(raster_cat_split_dir, img_filename))
+    
+    config_data = {
+        "dataset_name": "quickdraw", "quickdraw_std_dev": std_dev, "category_map": category_map,
+        "categories_processed": categories_to_process, "train_ratio": train_r, "val_ratio": val_r,
+        "test_ratio": round(1.0 - train_r - val_r, 2), 
+        "max_items_per_category_processed": max_items_cat if max_items_cat else "all",
+        "vector_data_path_relative": "quickdraw_vector", 
+        "raster_data_path_relative": "quickdraw_raster", 
+        "raster_image_size": RASTER_IMG_SIZE,
+        "data_format_note_vector": "Each .npy file in quickdraw_vector: list of sequences [N,5] (dx,dy,p0,p1,p2), dx,dy normalized.",
+        "data_format_note_raster": f"PNG images in quickdraw_raster, {RASTER_IMG_SIZE}x{RASTER_IMG_SIZE}, binary."
     }
-    cfg_path = os.path.join(proc_base, CONFIG_FILENAME)
-    with open(cfg_path, 'w') as f:
-        json.dump(cfg, f, indent=2)
-    print(f"\nPreprocessing complete. Config written to {cfg_path}")
+    config_file_path = os.path.join(vector_proc_base, CONFIG_FILENAME) 
+    with open(config_file_path, 'w') as f: json.dump(config_data, f, indent=4)
+    print(f"\nPreprocessing complete. Vector and Raster data saved. Config: {config_file_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Download, convert, normalize, and split QuickDraw (vector) dataset."
-    )
-    parser.add_argument(
-        "--categories", nargs="+", default=DEFAULT_CATEGORIES,
-        help="List of QuickDraw categories (simplified) to process."
-    )
-    parser.add_argument(
-        "--raw_dir", default=RAW_DOWNLOAD_DIR_ROOT,
-        help="Directory for raw .ndjson files."
-    )
-    parser.add_argument(
-        "--processed_dir", default=PROCESSED_DATA_DIR_ROOT,
-        help="Directory to save processed data."
-    )
-    parser.add_argument(
-        "--train_ratio", type=float, default=TRAIN_RATIO,
-        help="Fraction of sketches for training."
-    )
-    parser.add_argument(
-        "--val_ratio", type=float, default=VAL_RATIO,
-        help="Fraction of sketches for validation."
-    )
+    parser = argparse.ArgumentParser(description="QuickDraw Preprocessing (Vector & Raster).")
+    parser.add_argument("--categories", nargs="+", default=None)
+    parser.add_argument("--all_categories", action="store_true")
+    # Arguments now directly use the globally defined defaults (which are script-relative)
+    parser.add_argument("--raw_dir", default=RAW_DOWNLOAD_DIR_ROOT, 
+                        help=f"Dir for raw .ndjson files (default: {RAW_DOWNLOAD_DIR_ROOT})")
+    parser.add_argument("--processed_dir", default=PROCESSED_DATA_DIR_ROOT, 
+                        help=f"Base directory to save processed data (default: {PROCESSED_DATA_DIR_ROOT})")
+    parser.add_argument("--train_ratio", type=float, default=TRAIN_RATIO)
+    parser.add_argument("--val_ratio", type=float, default=VAL_RATIO)
+    parser.add_argument("--max_items_per_category", type=int, default=None)
     args = parser.parse_args()
+
     if args.train_ratio + args.val_ratio >= 1.0:
-        raise ValueError("train_ratio + val_ratio must be < 1.0")
+        raise ValueError("train_ratio + val_ratio must be < 1.0.")
+
+    # Ensure the directories exist based on arguments or defaults
+    os.makedirs(args.raw_dir, exist_ok=True)
+    os.makedirs(args.processed_dir, exist_ok=True)
+    print(f"Using Raw Directory: {os.path.abspath(args.raw_dir)}")
+    print(f"Using Processed Directory: {os.path.abspath(args.processed_dir)}")
+
+
+    categories_to_run = []
+    if args.all_categories:
+        print("Attempting to download the full list of categories...")
+        downloaded_categories = download_all_categories_list()
+        if downloaded_categories: categories_to_run = downloaded_categories
+        else: print("Failed to download category list. Using smaller fallback list."); categories_to_run = FALLBACK_CATEGORIES
+        print(f"Processing {len(categories_to_run)} QuickDraw categories.")
+    elif args.categories:
+        categories_to_run = sorted(list(set(args.categories))) 
+        print(f"Processing specified categories: {categories_to_run}")
+    else:
+        categories_to_run = sorted(DEFAULT_CATEGORIES) 
+        print(f"Using DEFAULT categories: {categories_to_run}")
+    
     main(
-        args.categories,
-        args.raw_dir,
-        args.processed_dir,
-        args.train_ratio,
-        args.val_ratio
+        categories_to_process=categories_to_run,
+        raw_dir_param=args.raw_dir, # Pass the potentially overridden paths to main
+        processed_dir_base_param=args.processed_dir, 
+        train_r=args.train_ratio,
+        val_r=args.val_ratio,
+        max_items_cat=args.max_items_per_category
     )
