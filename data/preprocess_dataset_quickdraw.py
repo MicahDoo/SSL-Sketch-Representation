@@ -7,14 +7,13 @@ import numpy as np
 import requests
 from tqdm import tqdm
 from PIL import Image, ImageDraw 
-import multiprocessing # Added for parallel processing
+import multiprocessing
 
 # --- Configuration ---
 BASE_DOWNLOAD_URL = "https://storage.googleapis.com/quickdraw_dataset/full/simplified/"
 CATEGORIES_LIST_URL = "https://raw.githubusercontent.com/googlecreativelab/quickdraw-dataset/master/categories.txt"
 DEFAULT_CATEGORIES = [
-    "cat", "dog", "apple", "car", "tree", 
-    #"house", "bicycle", "bird", "face", "airplane"
+    "cat", "dog", "apple", "car", "tree", "house", "bicycle", "bird", "face", "airplane"
 ]
 FALLBACK_CATEGORIES = DEFAULT_CATEGORIES
 
@@ -54,7 +53,8 @@ def download_category_file(category_name, target_dir, skip_actual_download=False
         return target_path, True
     
     if skip_actual_download:
-        print(f"Skipping download for '{file_name}' as --skip_raw_download is set, but file not found locally.")
+        # This message is now more of a fallback, as main() should pre-filter
+        print(f"File '{file_name}' not found locally and --skip_raw_download is set. Download will be skipped.")
         return target_path, False
 
     try:
@@ -83,14 +83,13 @@ def load_simplified_drawings(ndjson_path, max_items_per_category=None):
                     if obj.get('recognized', False): drawings.append(obj['drawing'])
                 except (json.JSONDecodeError, KeyError): pass
     except FileNotFoundError: 
+        # This case should be less frequent if main() pre-filters when skip_raw_download is True
         print(f"Warning: File not found during load: {ndjson_path}. Skipping category.")
         return [] 
     except Exception as e: print(f"Error reading file {ndjson_path}: {e}")
     return drawings
 
-# This function needs to be at the top level or picklable for multiprocessing
 def convert_raw_sketch_to_delta_sequence_mp_helper(raw_sketch_strokes):
-    """Helper for multiprocessing, calls the main conversion function."""
     return convert_raw_sketch_to_delta_sequence(raw_sketch_strokes)
 
 def convert_raw_sketch_to_delta_sequence(raw_sketch_strokes):
@@ -162,7 +161,6 @@ def rasterize_sequence_to_pil_image(normalized_vector_sequence_np, image_size, l
     del draw
     return image.convert("1")
 
-# Helper function for Pass 2 parallel processing
 def normalize_and_rasterize_mp_helper(args_tuple):
     seq_array, std_dev_val, raster_img_size_val = args_tuple
     norm_seq = seq_array.copy()
@@ -170,62 +168,95 @@ def normalize_and_rasterize_mp_helper(args_tuple):
     pil_img = rasterize_sequence_to_pil_image(norm_seq, raster_img_size_val)
     return norm_seq, pil_img
 
-
-def main(categories_to_process, raw_dir_param, processed_dir_base_param, train_r, val_r, max_items_cat, skip_raw_download_flag, num_workers_preprocess):
-    print(f"--- Starting QuickDraw Preprocessing for {len(categories_to_process)} categories ---")
+def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param, train_r, val_r, max_items_cat, skip_raw_download_flag, num_workers_preprocess):
+    print(f"--- Starting QuickDraw Preprocessing for initially {len(categories_to_process_initial)} target categories ---")
     if skip_raw_download_flag:
-        print("!!! --skip_raw_download flag is active. Will not attempt to download missing .ndjson files. !!!")
+        print("!!! --skip_raw_download flag is active. Will only process locally existing .ndjson files. !!!")
     if max_items_cat: print(f"Max items per category: {max_items_cat}.")
     
-    # Determine number of processes for the pool based on num_workers_preprocess
     pool_processes = None 
-    actual_workers_to_be_used = 0 # To store the number that will actually be used by Pool
-
+    actual_workers_to_be_used = 0
     if num_workers_preprocess is not None and num_workers_preprocess <= 0:
-        pool_processes = 1 
-        actual_workers_to_be_used = 1
+        pool_processes = 1; actual_workers_to_be_used = 1
         print(f"Using {actual_workers_to_be_used} worker process for CPU-bound tasks (num_workers_preprocess <= 0).")
     elif num_workers_preprocess is not None:
-        pool_processes = num_workers_preprocess
-        actual_workers_to_be_used = pool_processes
+        pool_processes = num_workers_preprocess; actual_workers_to_be_used = pool_processes
         print(f"Using {actual_workers_to_be_used} worker processes for CPU-bound tasks.")
     else: 
         try:
             actual_workers_to_be_used = os.cpu_count()
-            # pool_processes remains None, so Pool uses os.cpu_count()
             print(f"Using default number of worker processes (os.cpu_count() = {actual_workers_to_be_used}) for CPU-bound tasks.")
         except NotImplementedError:
             print("Warning: os.cpu_count() is not available. Defaulting to 1 worker process.")
-            pool_processes = 1
-            actual_workers_to_be_used = 1
-
+            pool_processes = 1; actual_workers_to_be_used = 1
 
     vector_proc_base = os.path.join(processed_dir_base_param, "quickdraw_vector")
     raster_proc_base = os.path.join(processed_dir_base_param, "quickdraw_raster")
+    raw_ndjson_dir_path = os.path.join(raw_dir_param, "quickdraw_raw") # Define path to raw .ndjson files
     
     os.makedirs(vector_proc_base, exist_ok=True)
     os.makedirs(raster_proc_base, exist_ok=True)
     for split in ("train", "val", "test"):
         os.makedirs(os.path.join(vector_proc_base, split), exist_ok=True)
         os.makedirs(os.path.join(raster_proc_base, split), exist_ok=True)
-        for cat_name in categories_to_process:
+        # Category subdirs for raster images are created later, only for categories with data
+
+    # --- Determine effective categories to process ---
+    categories_to_actually_process = []
+    tqdm_desc_cat_load = "Checking/Downloading Categories"
+    if skip_raw_download_flag:
+        print(f"Scanning {raw_ndjson_dir_path} for existing .ndjson files...")
+        tqdm_desc_cat_load = "Identifying Local Categories"
+        if os.path.isdir(raw_ndjson_dir_path):
+            existing_ndjson_files = {f for f in os.listdir(raw_ndjson_dir_path) if f.endswith(".ndjson")}
+            for cat_name in categories_to_process_initial:
+                if f"{cat_name}.ndjson" in existing_ndjson_files:
+                    categories_to_actually_process.append(cat_name)
+            if not categories_to_actually_process and categories_to_process_initial:
+                print(f"Warning: --skip_raw_download is set, but no .ndjson files found in {raw_ndjson_dir_path} for the target categories.")
+            elif categories_to_actually_process:
+                 print(f"Found {len(categories_to_actually_process)} categories locally. Will process only these.")
+        else:
+            print(f"Warning: --skip_raw_download is set, but raw directory {raw_ndjson_dir_path} not found.")
+        if not categories_to_actually_process: # If still empty, means no local files for target list
+             print("No local files found for the specified categories. No categories will be processed.")
+             return # Exit if no categories to process
+    else:
+        categories_to_actually_process = categories_to_process_initial
+
+    if not categories_to_actually_process:
+        print("No categories to process. Exiting.")
+        return
+    
+    print(f"Final list of categories to process: {len(categories_to_actually_process)}")
+    # Create raster category subdirs only for categories that will actually be processed
+    for split in ("train", "val", "test"):
+        for cat_name in categories_to_actually_process:
              os.makedirs(os.path.join(raster_proc_base, split, cat_name), exist_ok=True)
+
 
     all_sketches_by_cat = {}
     category_map = {}
         
-    for idx, cat_name in enumerate(tqdm(categories_to_process, desc="Checking/Downloading Categories")):
-        category_map[cat_name] = idx
+    for idx, cat_name in enumerate(tqdm(categories_to_actually_process, desc=tqdm_desc_cat_load)):
+        category_map[cat_name] = idx # Map based on the final list being processed
         ndjson_path, ok = download_category_file(cat_name, raw_dir_param, skip_actual_download=skip_raw_download_flag)
         if not ok: 
-            print(f"  -> Skipping '{cat_name}' (file not found and download skipped, or download failed).")
+            # This should ideally not happen if skip_raw_download_flag is True because categories_to_actually_process was pre-filtered
+            print(f"  -> Critical: Skipping '{cat_name}' (file check failed unexpectedly or download failed).")
             continue
         
         drawings = load_simplified_drawings(ndjson_path, max_items_per_category=max_items_cat)
         if drawings: all_sketches_by_cat[cat_name] = drawings
         else: print(f"  -> No valid drawings loaded for '{cat_name}'.")
 
+    # Check if any categories were successfully loaded before proceeding
+    if not all_sketches_by_cat:
+        print("No sketches loaded for any category. Aborting further processing.")
+        return
+
     print("\n--- Pass 1: Converting & Calculating StdDev ---")
+    # ... (rest of Pass 1 and Pass 2 logic remains the same as in previous version) ...
     all_train_candidate_deltas = []
     all_processed_sketches_by_cat = {}
     
@@ -242,7 +273,7 @@ def main(categories_to_process, raw_dir_param, processed_dir_base_param, train_r
                 all_train_candidate_deltas.extend(seq_array[:,0]); all_train_candidate_deltas.extend(seq_array[:,1])
     else: 
         print(f"  Executing Pass 1 conversions with a pool of {actual_workers_to_be_used} processes.")
-        with multiprocessing.Pool(processes=pool_processes) as pool: # pool_processes can be None here
+        with multiprocessing.Pool(processes=pool_processes) as pool: 
             for cat_name, raw_drawings in tqdm(all_sketches_by_cat.items(), desc="Pass 1 Processing (Multi Proc)"):
                 results = pool.map(convert_raw_sketch_to_delta_sequence_mp_helper, raw_drawings)
                 processed_sequences_for_cat = [seq for seq in results if seq.size > 0]
@@ -284,10 +315,9 @@ def main(categories_to_process, raw_dir_param, processed_dir_base_param, train_r
                 for i, pil_img in enumerate(raster_split_data):
                     img_filename = f"sketch_{i:05d}.png"
                     pil_img.save(os.path.join(raster_cat_split_dir, img_filename))
-
     else: 
         print(f"  Executing Pass 2 (Normalize & Rasterize) with a pool of {actual_workers_to_be_used} processes.")
-        with multiprocessing.Pool(processes=pool_processes) as pool: # pool_processes can be None here
+        with multiprocessing.Pool(processes=pool_processes) as pool: 
             for cat_name, processed_sequences in tqdm(all_processed_sketches_by_cat.items(), desc="Pass 2 (Multi Proc)"):
                 tasks = [(seq, std_dev, RASTER_IMG_SIZE) for seq in processed_sequences]
                 norm_and_raster_results = pool.map(normalize_and_rasterize_mp_helper, tasks)
@@ -310,8 +340,9 @@ def main(categories_to_process, raw_dir_param, processed_dir_base_param, train_r
                         pil_img.save(os.path.join(raster_cat_split_dir, img_filename))
 
     config_data = {
-        "dataset_name": "quickdraw", "quickdraw_std_dev": std_dev, "category_map": category_map,
-        "categories_processed": categories_to_process, "train_ratio": train_r, "val_ratio": val_r,
+        "dataset_name": "quickdraw", "quickdraw_std_dev": std_dev, "category_map": category_map, # category_map is now based on actually processed categories
+        "categories_processed": categories_to_actually_process, # Store the list of categories that were actually processed
+        "train_ratio": train_r, "val_ratio": val_r,
         "test_ratio": round(1.0 - train_r - val_r, 2), 
         "max_items_per_category_processed": max_items_cat if max_items_cat else "all",
         "vector_data_path_relative": "quickdraw_vector", 
@@ -329,7 +360,7 @@ if __name__ == "__main__":
     parser.add_argument("--categories", nargs="+", default=None)
     parser.add_argument("--all_categories", action="store_true")
     parser.add_argument("--skip_raw_download", action="store_true", 
-                        help="Skip attempting to download raw .ndjson files.")
+                        help="Skip attempting to download raw .ndjson files. Only processes locally existing files from the target categories.")
     parser.add_argument("--raw_dir", default=RAW_DOWNLOAD_DIR_ROOT, 
                         help=f"Dir for raw .ndjson files (default: {RAW_DOWNLOAD_DIR_ROOT})")
     parser.add_argument("--processed_dir", default=PROCESSED_DATA_DIR_ROOT, 
@@ -350,22 +381,22 @@ if __name__ == "__main__":
     print(f"Using Raw Directory: {os.path.abspath(args.raw_dir)}")
     print(f"Using Processed Directory: {os.path.abspath(args.processed_dir)}")
 
-    categories_to_run = []
+    categories_to_process_initial_list = [] # Renamed to avoid confusion
     if args.all_categories:
         print("Attempting to download the full list of categories...")
         downloaded_categories = download_all_categories_list()
-        if downloaded_categories: categories_to_run = downloaded_categories
-        else: print("Failed to download category list. Using smaller fallback list."); categories_to_run = FALLBACK_CATEGORIES
-        print(f"Processing {len(categories_to_run)} QuickDraw categories.")
+        if downloaded_categories: categories_to_process_initial_list = downloaded_categories
+        else: print("Failed to download category list. Using smaller fallback list."); categories_to_process_initial_list = FALLBACK_CATEGORIES
+        print(f"Targeting {len(categories_to_process_initial_list)} QuickDraw categories.")
     elif args.categories:
-        categories_to_run = sorted(list(set(args.categories))) 
-        print(f"Processing specified categories: {categories_to_run}")
+        categories_to_process_initial_list = sorted(list(set(args.categories))) 
+        print(f"Targeting specified categories: {categories_to_process_initial_list}")
     else:
-        categories_to_run = sorted(DEFAULT_CATEGORIES) 
-        print(f"Using DEFAULT categories: {categories_to_run}")
+        categories_to_process_initial_list = sorted(DEFAULT_CATEGORIES) 
+        print(f"Targeting DEFAULT categories: {categories_to_process_initial_list}")
     
     main(
-        categories_to_process=categories_to_run,
+        categories_to_process_initial=categories_to_process_initial_list, # Pass the initial target list
         raw_dir_param=args.raw_dir, 
         processed_dir_base_param=args.processed_dir, 
         train_r=args.train_ratio,
