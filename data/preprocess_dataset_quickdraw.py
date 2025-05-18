@@ -75,10 +75,15 @@ def download_category_file(category_name, target_dir, skip_actual_download=False
 # Helper for multiprocessing load_simplified_drawings
 def load_simplified_drawings_mp_helper(args_tuple):
     ndjson_path, max_items = args_tuple
+    # pid = os.getpid() # Get current process ID
+    # print(f"[Worker PID: {pid}] Loading drawings from: {os.path.basename(ndjson_path)} (max_items: {max_items})")
     try:
-        return load_simplified_drawings(ndjson_path, max_items)
+        result = load_simplified_drawings(ndjson_path, max_items)
+        # print(f"[Worker PID: {pid}] Finished loading {len(result)} drawings from: {os.path.basename(ndjson_path)}")
+        return result
     except Exception as e:
-        # print(f"Error in worker (load_simplified_drawings): {ndjson_path} - {e}")
+        # print(f"[Worker PID: {pid}] ERROR loading drawings from {os.path.basename(ndjson_path)}: {e}")
+        # print(traceback.format_exc())
         return [] # Return empty list on error
 
 def load_simplified_drawings(ndjson_path, max_items_per_category=None):
@@ -97,12 +102,23 @@ def load_simplified_drawings(ndjson_path, max_items_per_category=None):
     except Exception as e: print(f"Error reading file {ndjson_path}: {e}")
     return drawings
 
-def convert_raw_sketch_to_delta_sequence_mp_helper(raw_sketch_strokes):
+def convert_raw_sketch_to_delta_sequence_mp_helper(raw_sketch_strokes_with_id):
+    """Helper for multiprocessing, calls the main conversion function and adds error handling."""
+    # raw_sketch_strokes_with_id could be a tuple (original_index, raw_sketch_strokes) if you need to track
+    # For now, assume it's just raw_sketch_strokes
+    # pid = os.getpid()
+    # print(f"[Worker PID: {pid}] Starting delta conversion for a sketch...")
     try:
-        result = convert_raw_sketch_to_delta_sequence(raw_sketch_strokes)
-        if result.size == 0 : return None
+        result = convert_raw_sketch_to_delta_sequence(raw_sketch_strokes_with_id) # Pass raw_sketch_strokes directly
+        if result.size == 0 : 
+            # print(f"[Worker PID: {pid}] Delta conversion resulted in empty sequence.")
+            return None
+        # print(f"[Worker PID: {pid}] Finished delta conversion successfully.")
         return result
     except Exception as e:
+        # pid_err = os.getpid()
+        # print(f"[Worker PID: {pid_err}] ERROR during delta conversion: {e}")
+        # print(traceback.format_exc()) 
         return None 
 
 def convert_raw_sketch_to_delta_sequence(raw_sketch_strokes):
@@ -174,14 +190,21 @@ def rasterize_sequence_to_pil_image(normalized_vector_sequence_np, image_size, l
     del draw
     return image.convert("1")
 
+# Helper function for Pass 2 parallel processing
 def normalize_and_rasterize_mp_helper(args_tuple):
     seq_array, std_dev_val, raster_img_size_val = args_tuple
+    # pid = os.getpid()
+    # print(f"[Worker PID: {pid}] Normalizing and rasterizing a sequence...")
     try:
         norm_seq = seq_array.copy()
         norm_seq[:, :2] /= std_dev_val
         pil_img = rasterize_sequence_to_pil_image(norm_seq, raster_img_size_val)
+        # print(f"[Worker PID: {pid}] Finished normalizing and rasterizing.")
         return norm_seq, pil_img
     except Exception as e:
+        # pid_err = os.getpid()
+        # print(f"[Worker PID: {pid_err}] ERROR during normalize/rasterize: {e}")
+        # print(traceback.format_exc())
         return None, None 
 
 def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param, train_r, val_r, max_items_cat, skip_raw_download_flag, num_workers_preprocess):
@@ -192,11 +215,14 @@ def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param,
     
     pool_processes = None 
     actual_workers_to_be_used = 0
+
     if num_workers_preprocess is not None and num_workers_preprocess <= 0:
-        pool_processes = 1; actual_workers_to_be_used = 1
+        pool_processes = 1 
+        actual_workers_to_be_used = 1
         print(f"Using {actual_workers_to_be_used} worker process for CPU-bound tasks (num_workers_preprocess <= 0).")
     elif num_workers_preprocess is not None:
-        pool_processes = num_workers_preprocess; actual_workers_to_be_used = pool_processes
+        pool_processes = num_workers_preprocess
+        actual_workers_to_be_used = pool_processes
         print(f"Using {actual_workers_to_be_used} worker processes for CPU-bound tasks.")
     else: 
         try:
@@ -251,7 +277,6 @@ def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param,
         for cat_name in categories_to_actually_process:
              os.makedirs(os.path.join(raster_proc_base, split, cat_name), exist_ok=True)
 
-    # --- Stage 1: Prepare tasks for loading drawings ---
     category_map = {}
     load_drawing_tasks = []
     print("\n--- Preparing tasks for loading raw drawings ---")
@@ -263,7 +288,6 @@ def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param,
             continue
         load_drawing_tasks.append((cat_name, ndjson_path, max_items_cat))
 
-    # --- Stage 2: Load drawings in parallel (or sequentially) ---
     all_sketches_by_cat = {}
     if load_drawing_tasks:
         print(f"\n--- Loading drawings for {len(load_drawing_tasks)} categories ---")
@@ -275,15 +299,11 @@ def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param,
                 else: print(f"  -> No valid drawings loaded for '{cat_name}'.")
         else:
             print(f"  Executing drawing loading with a pool of {actual_workers_to_be_used} processes.")
-            # Prepare arguments for the helper function for pool.map
-            # pool.map takes an iterable of single arguments, so our helper needs to take one arg (a tuple)
-            map_args = [(task[1], task[2]) for task in load_drawing_tasks] # (ndjson_path, max_items)
+            map_args = [(task[1], task[2]) for task in load_drawing_tasks] 
             chunk_size_load = max(1, len(map_args) // (actual_workers_to_be_used * 4)) if actual_workers_to_be_used > 0 else 1
-            
             with multiprocessing.Pool(processes=pool_processes) as pool:
                 results_drawings_lists = list(tqdm(pool.imap(load_simplified_drawings_mp_helper, map_args, chunksize=chunk_size_load), 
                                                    total=len(map_args), desc="Loading Drawings (Multi Proc)"))
-            
             for i, (cat_name, _, _) in enumerate(load_drawing_tasks):
                 drawings = results_drawings_lists[i]
                 if drawings: all_sketches_by_cat[cat_name] = drawings
@@ -294,7 +314,6 @@ def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param,
         return
 
     print("\n--- Pass 1: Converting & Calculating StdDev ---")
-    # ... (rest of Pass 1 and Pass 2 logic remains the same as in previous version, using all_sketches_by_cat) ...
     all_train_candidate_deltas = []
     all_processed_sketches_by_cat = {}
     
@@ -317,6 +336,7 @@ def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param,
         with multiprocessing.Pool(processes=pool_processes) as pool: 
             for cat_name, raw_drawings in tqdm(all_sketches_by_cat.items(), desc="Pass 1 Processing (Multi Proc)"):
                 chunk_size = max(1, len(raw_drawings) // (actual_workers_to_be_used * 4)) if actual_workers_to_be_used > 0 else 1
+                # Pass raw_drawings directly to the helper, which calls the main conversion function
                 results = pool.map(convert_raw_sketch_to_delta_sequence_mp_helper, raw_drawings, chunksize=chunk_size)
                 processed_sequences_for_cat = [seq for seq in results if seq is not None and seq.size > 0] 
                 if not processed_sequences_for_cat: print(f"No valid sequences for '{cat_name}'."); continue
