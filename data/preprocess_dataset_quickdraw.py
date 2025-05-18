@@ -326,7 +326,9 @@ def stats_for_category_task(args_tuple):
 
 def merge_stats_parallel(stat_results_list):
     total_n, total_mean, total_M2 = 0.0, 0.0, 0.0
-    for cat_name, n_cat, mean_cat, M2_cat in stat_results_list: 
+    # Corrected: stat_results_list contains tuples of (n_cat, mean_cat, M2_cat)
+    # The cat_name was used to populate stats_progress, but not directly passed in this list structure.
+    for n_cat, mean_cat, M2_cat in stat_results_list: 
         if n_cat == 0: continue 
         if total_n == 0: 
             total_n, total_mean, total_M2 = n_cat, mean_cat, M2_cat
@@ -361,7 +363,6 @@ def main():
 
     target_categories = []
     if args.all_categories:
-        # This is where download_all_categories_list is called
         downloaded_cats = download_all_categories_list() 
         target_categories = downloaded_cats if downloaded_cats else FALLBACK_CATEGORIES
     elif args.categories: target_categories = sorted(list(set(args.categories)))
@@ -420,20 +421,27 @@ def main():
             else: print("Warning: Main config not found, std_dev might be default.")
         else:
             print(f"Calculating stats for {len(categories_for_stats)} new/remaining categories...")
-            stats_tasks = [(cat, args.raw_dir, args.max_items_per_category) for cat in categories_for_stats]
-            with Pool(processes=args.threads) as pool:
-                results_iterator = pool.imap(stats_for_category_task, stats_tasks)
-                for cat_name, n_cat, mean_cat, M2_cat in tqdm(results_iterator, total=len(stats_tasks), desc="Stats Calculation"):
-                    stats_progress[cat_name] = [float(n_cat), float(mean_cat), float(M2_cat)]
-                    with open(stats_progress_file, "w") as f: json.dump(stats_progress, f, indent=2)
+            stats_tasks = [(cat, os.path.join(args.raw_dir, f"{cat}.ndjson"), args.max_items_per_category) 
+                           for cat in categories_for_stats
+                           if os.path.exists(os.path.join(args.raw_dir, f"{cat}.ndjson"))] 
+            
+            if not stats_tasks:
+                print("No valid .ndjson files found for categories needing stats. Skipping stats calculation.")
+            else:
+                with Pool(processes=args.threads) as pool:
+                    results_iterator = pool.imap(stats_for_category_task, stats_tasks)
+                    for cat_name, n_cat, mean_cat, M2_cat in tqdm(results_iterator, total=len(stats_tasks), desc="Stats Calculation"):
+                        stats_progress[cat_name] = [float(n_cat), float(mean_cat), float(M2_cat)]
+                        with open(stats_progress_file, "w") as f: json.dump(stats_progress, f, indent=2)
             
             all_cat_stats_for_merge = []
             for cat_name_stat in target_categories: 
                 if cat_name_stat in stats_progress: 
-                    all_cat_stats_for_merge.append(stats_progress[cat_name_stat])
+                    all_cat_stats_for_merge.append(stats_progress[cat_name_stat]) # This is a list of [n, mean, M2]
+            
             if not all_cat_stats_for_merge: print("No stats to compute global std_dev.")
             else:
-                total_n_all, _, total_M2_all = merge_stats_parallel(all_cat_stats_for_merge)
+                total_n_all, _, total_M2_all = merge_stats_parallel(all_cat_stats_for_merge) # Pass list of lists
                 if total_n_all > 1: global_std_dev = float(np.sqrt(total_M2_all / (total_n_all - 1)))
                 global_std_dev = max(global_std_dev, 1e-6)
             print(f"→ Global std_dev calculated: {global_std_dev:.6f}")
