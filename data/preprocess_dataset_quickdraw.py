@@ -28,7 +28,7 @@ CONFIG_FILENAME = "quickdraw_config.json"
 
 # --- Helper Functions --- 
 def download_all_categories_list(url=CATEGORIES_LIST_URL):
-    print(f"Attempting to download category list from {url}...")
+    print(f"Attempting to download category list from {url}...") # Line 31
     try:
         response = requests.get(url)
         response.raise_for_status()
@@ -53,7 +53,6 @@ def download_category_file(category_name, target_dir, skip_actual_download=False
         return target_path, True
     
     if skip_actual_download:
-        # This message is now more of a fallback, as main() should pre-filter
         print(f"File '{file_name}' not found locally and --skip_raw_download is set. Download will be skipped.")
         return target_path, False
 
@@ -83,7 +82,6 @@ def load_simplified_drawings(ndjson_path, max_items_per_category=None):
                     if obj.get('recognized', False): drawings.append(obj['drawing'])
                 except (json.JSONDecodeError, KeyError): pass
     except FileNotFoundError: 
-        # This case should be less frequent if main() pre-filters when skip_raw_download is True
         print(f"Warning: File not found during load: {ndjson_path}. Skipping category.")
         return [] 
     except Exception as e: print(f"Error reading file {ndjson_path}: {e}")
@@ -192,16 +190,14 @@ def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param,
 
     vector_proc_base = os.path.join(processed_dir_base_param, "quickdraw_vector")
     raster_proc_base = os.path.join(processed_dir_base_param, "quickdraw_raster")
-    raw_ndjson_dir_path = os.path.join(raw_dir_param, "quickdraw_raw") # Define path to raw .ndjson files
+    raw_ndjson_dir_path = os.path.join(raw_dir_param, "quickdraw_raw") 
     
     os.makedirs(vector_proc_base, exist_ok=True)
     os.makedirs(raster_proc_base, exist_ok=True)
     for split in ("train", "val", "test"):
         os.makedirs(os.path.join(vector_proc_base, split), exist_ok=True)
         os.makedirs(os.path.join(raster_proc_base, split), exist_ok=True)
-        # Category subdirs for raster images are created later, only for categories with data
 
-    # --- Determine effective categories to process ---
     categories_to_actually_process = []
     tqdm_desc_cat_load = "Checking/Downloading Categories"
     if skip_raw_download_flag:
@@ -218,9 +214,9 @@ def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param,
                  print(f"Found {len(categories_to_actually_process)} categories locally. Will process only these.")
         else:
             print(f"Warning: --skip_raw_download is set, but raw directory {raw_ndjson_dir_path} not found.")
-        if not categories_to_actually_process: # If still empty, means no local files for target list
+        if not categories_to_actually_process: 
              print("No local files found for the specified categories. No categories will be processed.")
-             return # Exit if no categories to process
+             return 
     else:
         categories_to_actually_process = categories_to_process_initial
 
@@ -229,20 +225,17 @@ def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param,
         return
     
     print(f"Final list of categories to process: {len(categories_to_actually_process)}")
-    # Create raster category subdirs only for categories that will actually be processed
     for split in ("train", "val", "test"):
         for cat_name in categories_to_actually_process:
              os.makedirs(os.path.join(raster_proc_base, split, cat_name), exist_ok=True)
-
 
     all_sketches_by_cat = {}
     category_map = {}
         
     for idx, cat_name in enumerate(tqdm(categories_to_actually_process, desc=tqdm_desc_cat_load)):
-        category_map[cat_name] = idx # Map based on the final list being processed
+        category_map[cat_name] = idx 
         ndjson_path, ok = download_category_file(cat_name, raw_dir_param, skip_actual_download=skip_raw_download_flag)
         if not ok: 
-            # This should ideally not happen if skip_raw_download_flag is True because categories_to_actually_process was pre-filtered
             print(f"  -> Critical: Skipping '{cat_name}' (file check failed unexpectedly or download failed).")
             continue
         
@@ -250,13 +243,11 @@ def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param,
         if drawings: all_sketches_by_cat[cat_name] = drawings
         else: print(f"  -> No valid drawings loaded for '{cat_name}'.")
 
-    # Check if any categories were successfully loaded before proceeding
     if not all_sketches_by_cat:
         print("No sketches loaded for any category. Aborting further processing.")
         return
 
     print("\n--- Pass 1: Converting & Calculating StdDev ---")
-    # ... (rest of Pass 1 and Pass 2 logic remains the same as in previous version) ...
     all_train_candidate_deltas = []
     all_processed_sketches_by_cat = {}
     
@@ -340,8 +331,8 @@ def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param,
                         pil_img.save(os.path.join(raster_cat_split_dir, img_filename))
 
     config_data = {
-        "dataset_name": "quickdraw", "quickdraw_std_dev": std_dev, "category_map": category_map, # category_map is now based on actually processed categories
-        "categories_processed": categories_to_actually_process, # Store the list of categories that were actually processed
+        "dataset_name": "quickdraw", "quickdraw_std_dev": std_dev, "category_map": category_map, 
+        "categories_processed": categories_to_actually_process, 
         "train_ratio": train_r, "val_ratio": val_r,
         "test_ratio": round(1.0 - train_r - val_r, 2), 
         "max_items_per_category_processed": max_items_cat if max_items_cat else "all",
@@ -381,7 +372,7 @@ if __name__ == "__main__":
     print(f"Using Raw Directory: {os.path.abspath(args.raw_dir)}")
     print(f"Using Processed Directory: {os.path.abspath(args.processed_dir)}")
 
-    categories_to_process_initial_list = [] # Renamed to avoid confusion
+    categories_to_process_initial_list = [] 
     if args.all_categories:
         print("Attempting to download the full list of categories...")
         downloaded_categories = download_all_categories_list()
@@ -396,7 +387,7 @@ if __name__ == "__main__":
         print(f"Targeting DEFAULT categories: {categories_to_process_initial_list}")
     
     main(
-        categories_to_process_initial=categories_to_process_initial_list, # Pass the initial target list
+        categories_to_process_initial=categories_to_process_initial_list, 
         raw_dir_param=args.raw_dir, 
         processed_dir_base_param=args.processed_dir, 
         train_r=args.train_ratio,
