@@ -3,18 +3,13 @@ import sys
 import os
 
 # --- Path Setup ---
-# Get the directory containing this script (src/baselines/)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Get the project root directory (which should be two levels up from src/baselines/)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
-
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
     print(f"DEBUG: Added {PROJECT_ROOT} to sys.path")
 else:
     print(f"DEBUG: {PROJECT_ROOT} is already in sys.path")
-
 print(f"DEBUG: Current sys.path[0]: {sys.path[0] if sys.path else 'EMPTY'}")
 print(f"DEBUG: SCRIPT_DIR: {SCRIPT_DIR}")
 print(f"DEBUG: PROJECT_ROOT: {PROJECT_ROOT}")
@@ -31,18 +26,13 @@ import time
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-# Attempt to import from project structure
 try:
     from src.models.raster_encoder import ResNet50SketchEncoderBase
-    from data.dataset import SketchDataset # Your SketchDataset
+    from data.dataset import SketchDataset 
     print("DEBUG: Successfully imported ResNet50SketchEncoderBase and SketchDataset.")
 except ImportError as e:
     print(f"ERROR: Error importing modules: {e}")
     print("DEBUG: Please ensure 'src/models/raster_encoder.py' and 'data/dataset.py' exist.")
-    print(f"DEBUG: Project root (added to path): {PROJECT_ROOT}")
-    print(f"DEBUG: Effective sys.path for imports starts with: {sys.path[0] if sys.path else 'EMPTY'}")
-    print("DEBUG: Check that 'src' and 'data' are direct subdirectories of the project root,")
-    print("       and that they (and their submodules like 'models') have __init__.py files.")
     ResNet50SketchEncoderBase = None
     SketchDataset = None
 
@@ -53,10 +43,6 @@ DEFAULT_DATASET_NAME = "quickdraw"
 DEFAULT_CONFIG_FILENAME = "quickdraw_config.json"
 
 class SketchClassifier(nn.Module):
-    """
-    A classifier model that uses the ResNet50SketchEncoderBase as a backbone
-    and adds a classification head.
-    """
     def __init__(self, num_classes, input_channels=1, use_pretrained_backbone=False, freeze_backbone=False):
         super(SketchClassifier, self).__init__()
         self.backbone = ResNet50SketchEncoderBase(
@@ -72,7 +58,6 @@ class SketchClassifier(nn.Module):
         else:
             print("  Backbone trained from scratch.")
 
-
     def forward(self, x):
         features = self.backbone(x)
         logits = self.classifier_head(features)
@@ -82,73 +67,48 @@ def train_and_validate(model, train_dataloader, val_dataloader, loss_fn, optimiz
                        num_epochs, device, experiment_name="Classifier"):
     history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
     best_val_acc = 0.0
-    
     print(f"\n--- Starting Training: {experiment_name} for {num_epochs} epochs on {device} ---")
-
     for epoch in range(num_epochs):
         start_time_epoch = time.time()
-        
         model.train()
-        running_train_loss = 0.0
-        correct_train_preds = 0
-        total_train_samples = 0
-
+        running_train_loss = 0.0; correct_train_preds = 0; total_train_samples = 0
         for batch_idx, data_batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]", leave=False)):
             inputs = data_batch['raster_image'].to(device)
             targets = data_batch['label'].to(device)
-            
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = loss_fn(outputs, targets)
-            loss.backward()
-            optimizer.step()
-            
+            optimizer.zero_grad(); outputs = model(inputs); loss = loss_fn(outputs, targets)
+            loss.backward(); optimizer.step()
             running_train_loss += loss.item() * inputs.size(0)
             _, preds = torch.max(outputs, 1)
             correct_train_preds += torch.sum(preds == targets.data).item()
             total_train_samples += targets.size(0)
-            
         epoch_train_loss = running_train_loss / total_train_samples if total_train_samples > 0 else 0
         epoch_train_acc = correct_train_preds / total_train_samples if total_train_samples > 0 else 0
-        history['train_loss'].append(epoch_train_loss)
-        history['train_acc'].append(epoch_train_acc)
+        history['train_loss'].append(epoch_train_loss); history['train_acc'].append(epoch_train_acc)
 
         model.eval()
-        running_val_loss = 0.0
-        correct_val_preds = 0
-        total_val_samples = 0
+        running_val_loss = 0.0; correct_val_preds = 0; total_val_samples = 0
         with torch.no_grad():
             for batch_idx, data_batch in enumerate(tqdm(val_dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]", leave=False)):
                 inputs = data_batch['raster_image'].to(device)
                 targets = data_batch['label'].to(device)
-                
-                outputs = model(inputs)
-                loss = loss_fn(outputs, targets)
+                outputs = model(inputs); loss = loss_fn(outputs, targets)
                 running_val_loss += loss.item() * inputs.size(0)
                 _, preds = torch.max(outputs, 1)
                 correct_val_preds += torch.sum(preds == targets.data).item()
                 total_val_samples += targets.size(0)
-
         epoch_val_loss = running_val_loss / total_val_samples if total_val_samples > 0 else 0
         epoch_val_acc = correct_val_preds / total_val_samples if total_val_samples > 0 else 0
-        history['val_loss'].append(epoch_val_loss)
-        history['val_acc'].append(epoch_val_acc)
+        history['val_loss'].append(epoch_val_loss); history['val_acc'].append(epoch_val_acc)
         
         if scheduler:
-            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(epoch_val_loss)
-            else: 
-                scheduler.step()
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau): scheduler.step(epoch_val_loss)
+            else: scheduler.step()
         
         epoch_duration = time.time() - start_time_epoch
         print(f"Epoch {epoch+1}/{num_epochs} [{experiment_name}] - Dur: {epoch_duration:.1f}s")
         print(f"  TrL: {epoch_train_loss:.4f}, TrA: {epoch_train_acc:.4f} | VaL: {epoch_val_loss:.4f}, VaA: {epoch_val_acc:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
-            
         if epoch_val_acc > best_val_acc:
             best_val_acc = epoch_val_acc
-            # torch.save(model.state_dict(), f"{experiment_name.replace(' ','_')}_best_model.pth")
-            # print(f"    New best validation accuracy: {best_val_acc:.4f}. Model checkpoint saved.")
-            
     print(f"Training for {experiment_name} complete! Best Val Acc: {best_val_acc:.4f}")
     return history
 
@@ -166,7 +126,6 @@ def plot_training_history(history, experiment_name="Experiment", save_path=None)
         plt.savefig(save_path)
         print(f"Training history plot saved to {save_path}")
     plt.show()
-
 
 def main(args):
     if SketchDataset is None or ResNet50SketchEncoderBase is None:
@@ -201,18 +160,30 @@ def main(args):
             print("Error: num_classes not determined. Please provide --num_classes or ensure config file exists.")
             return
             
-    if not num_classes or num_classes == 0: # Added check for num_classes being None or 0
+    if not num_classes or num_classes == 0: 
         print("Error: Number of classes is 0 or not determined. Check config or --num_classes argument.")
         return
 
-    input_channels = 1
-    raster_image_transform = None 
+    input_channels_for_model = 1 # Default for training from scratch
+    raster_image_transform = None # Default: SketchDataset provides [1, H, W] tensor in [0,1]
     
     if args.use_pretrained:
-        input_channels = 3 
-        print("Using pretrained backbone. Expecting 3-channel normalized input to model.")
+        input_channels_for_model = 3 
+        print("Using pretrained backbone. Data will be transformed to 3-channels and normalized.")
+        # Define transform to repeat channel and apply ImageNet normalization
+        # This transform will be passed to SketchDataset
+        raster_image_transform = transforms.Compose([
+            transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.shape[0]==1 else x), # Repeat grayscale to 3 channels
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
     else:
         print("Training backbone from scratch. Expecting 1-channel input to model.")
+        # If SketchDataset already provides a ToTensor() that scales to [0,1],
+        # no further specific transform is strictly needed here for the 1-channel case.
+        # If normalization or other transforms are desired for scratch training, add them here.
+        # For example, to normalize a 1-channel image:
+        # raster_image_transform = transforms.Normalize(mean=[0.5], std=[0.5])
+
 
     print(f"Initializing SketchDataset for training (split: {args.train_split})...")
     train_dataset = SketchDataset(
@@ -222,7 +193,7 @@ def main(args):
         image_size=args.img_size,
         max_seq_len=args.max_seq_len, 
         config_filename=args.config_filename,
-        raster_transform=raster_image_transform 
+        raster_transform=raster_image_transform # Pass the defined transform
     )
     print(f"Initializing SketchDataset for validation (split: {args.val_split})...")
     val_dataset = SketchDataset(
@@ -232,7 +203,7 @@ def main(args):
         image_size=args.img_size,
         max_seq_len=args.max_seq_len,
         config_filename=args.config_filename,
-        raster_transform=raster_image_transform 
+        raster_transform=raster_image_transform # Pass the defined transform
     )
 
     if len(train_dataset) == 0 or len(val_dataset) == 0:
@@ -245,7 +216,7 @@ def main(args):
 
     model = SketchClassifier(
         num_classes=num_classes,
-        input_channels=input_channels,
+        input_channels=input_channels_for_model, # Use this for model definition
         use_pretrained_backbone=args.use_pretrained,
         freeze_backbone=args.freeze_backbone
     ).to(device)
@@ -253,7 +224,6 @@ def main(args):
     criterion = nn.CrossEntropyLoss()
     lr = args.lr if not args.use_pretrained else args.lr * 0.1 
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=args.weight_decay)
-    # Removed verbose=True for compatibility with older PyTorch versions
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=args.lr_patience, factor=0.1) 
 
     experiment_name = f"ResNetClassifier_Pretrained_{args.use_pretrained}"
