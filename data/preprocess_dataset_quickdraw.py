@@ -8,6 +8,7 @@ import argparse
 import time
 import numpy as np
 import requests
+import threading
 from tqdm import tqdm
 from PIL import Image, ImageDraw
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,6 +28,10 @@ SCRIPT_DIR         = os.path.dirname(os.path.abspath(__file__))
 RAW_DOWNLOAD_DIR   = os.path.join(SCRIPT_DIR, "..", "downloaded_data")
 PROCESSED_DATA_DIR = os.path.join(SCRIPT_DIR, "..", "processed_data")
 
+# --- tqdm bar positions ---
+TOP_POS = 0
+SUB_POS = 1
+
 
 def download_all_categories_list(url=CATEGORIES_LIST_URL):
     print(f"Attempting to download category list from {url}...")
@@ -42,7 +47,7 @@ def download_all_categories_list(url=CATEGORIES_LIST_URL):
     return None
 
 
-def download_category_file(cat_name, target_dir, skip_download=False):
+def download_category_file(cat_name, target_dir, skip_download=False, position=TOP_POS):
     safe    = cat_name.replace(" ", "%20")
     raw_dir = os.path.join(target_dir, "quickdraw_raw")
     os.makedirs(raw_dir, exist_ok=True)
@@ -61,7 +66,8 @@ def download_category_file(cat_name, target_dir, skip_download=False):
         total = int(resp.headers.get("content-length", 0))
         with open(outpath, "wb") as f, tqdm(
             desc=f"Downloading {cat_name:20}",
-            total=total, unit="iB", unit_scale=True, leave=False, position=0
+            total=total, unit="iB", unit_scale=True,
+            leave=False, position=position
         ) as bar:
             for chunk in resp.iter_content(4096):
                 if chunk:
@@ -77,7 +83,7 @@ def download_category_file(cat_name, target_dir, skip_download=False):
 def load_simplified_drawings(path,
                              max_items=None,
                              desc=None,
-                             position=None):
+                             position=SUB_POS):
     """Wrap the file iterator in tqdm so you see a per-line progress bar."""
     drawings = []
     try:
@@ -85,11 +91,11 @@ def load_simplified_drawings(path,
             total = max_items
             bar = tqdm(
                 f,
-                desc=desc or f"Loading {os.path.basename(path)}",
+                desc=(desc or f"Loading {os.path.basename(path)}"),
                 total=total,
                 unit="line",
-                leave=True,
-                position=position
+                leave=True,          # keep the bar after completion
+                position=position    # each thread/category gets its own line
             )
             for i, line in enumerate(bar):
                 if max_items is not None and i >= max_items:
@@ -187,9 +193,17 @@ def normalize_and_rasterize(args):
         return None, None
 
 
-def download_and_load(cat, raw_dir, max_items, skip_download, position):
+def download_and_load(cat, raw_dir, max_items, skip_download):
+    # figure out thread index from name, position bars SUB_POS+idx
+    name = threading.current_thread().name
+    try:
+        thread_idx = int(name.split("_")[-1])
+    except ValueError:
+        thread_idx = 0
+    pos = SUB_POS + thread_idx
+
     t0 = time.time()
-    path, ok = download_category_file(cat, raw_dir, skip_download)
+    path, ok = download_category_file(cat, raw_dir, skip_download, position=pos)
     dt_dl = time.time() - t0
 
     draws = []
@@ -199,8 +213,8 @@ def download_and_load(cat, raw_dir, max_items, skip_download, position):
         draws = load_simplified_drawings(
             path,
             max_items=max_items,
-            desc=f"Loading {cat:20}",
-            position=position
+            desc=f"Loading {cat}",
+            position=pos
         )
         dt_ld = time.time() - t1
 
@@ -246,17 +260,17 @@ def main(categories_initial, raw_dir, proc_dir,
     # --- Download + Load in parallel ---
     all_sketches = {}
     if use_parallel:
-        nd_threads = 8
+        nd_threads = min(8, len(cats))
         print(f"[Download+Load] using {nd_threads} threads")
         with ThreadPoolExecutor(max_workers=nd_threads) as ex:
-            futures = {
-                ex.submit(download_and_load, c, raw_dir, max_items, skip_download, idx+1): c
-                for idx, c in enumerate(cats)
-            }
+            futures = [
+                ex.submit(download_and_load, cat, raw_dir, max_items, skip_download)
+                for cat in cats
+            ]
             for fut in tqdm(as_completed(futures),
                             total=len(futures),
                             desc="Download+Load",
-                            position=0):
+                            position=TOP_POS):
                 cat, ok, draws, dt_dl, dt_ld = fut.result()
                 if not ok:
                     tqdm.write(f"→ skip '{cat}' (download fail) in {dt_dl:.2f}s")
@@ -266,9 +280,10 @@ def main(categories_initial, raw_dir, proc_dir,
                     all_sketches[cat] = draws
     else:
         print("[Download+Load] single-process mode")
-        for idx, cat in enumerate(tqdm(cats, desc="Download+Load", position=0)):
+        for idx, cat in enumerate(cats):
+            pos = SUB_POS + idx
             t0 = time.time()
-            path, ok = download_category_file(cat, raw_dir, skip_download)
+            path, ok = download_category_file(cat, raw_dir, skip_download, position=pos)
             dt_dl = time.time() - t0
             if not ok:
                 tqdm.write(f"→ skip '{cat}' (download fail) in {dt_dl:.2f}s")
@@ -277,8 +292,8 @@ def main(categories_initial, raw_dir, proc_dir,
             draws = load_simplified_drawings(
                 path,
                 max_items=max_items,
-                desc=f"Loading {cat:20}",
-                position=idx+1
+                desc=f"Loading {cat}",
+                position=pos
             )
             dt_ld = time.time() - t1
             tqdm.write(f"★ '{cat}': downloaded in {dt_dl:.2f}s, loaded {len(draws)} sketches in {dt_ld:.2f}s")
@@ -296,7 +311,8 @@ def main(categories_initial, raw_dir, proc_dir,
     for cat, draws in tqdm(all_sketches.items(),
                             total=len(all_sketches),
                             desc="Pass 1: δ-conversion",
-                            unit="cat"):
+                            unit="cat",
+                            position=TOP_POS):
         tqdm.write(f"[Pass1][{cat}] {len(draws)} drawings")
         t0 = time.time()
         if use_parallel:
@@ -306,12 +322,15 @@ def main(categories_initial, raw_dir, proc_dir,
                     total=len(draws),
                     desc=f"Δ→seq {cat}",
                     leave=False,
-                    position=0
+                    position=SUB_POS
                 ))
         else:
             seqs = [
                 convert_raw_sketch_to_delta_sequence(d)
-                for d in tqdm(draws, desc=f"Δ→seq {cat}", leave=False, position=0)
+                for d in tqdm(draws,
+                              desc=f"Δ→seq {cat}",
+                              leave=False,
+                              position=SUB_POS)
             ]
         dt    = time.time() - t0
         seqs  = [s for s in seqs if s is not None and s.size > 0]
@@ -329,8 +348,9 @@ def main(categories_initial, raw_dir, proc_dir,
     print(f"[Pass 2] normalize+raster with {num_w} processes")
     for cat, seqs in tqdm(all_seq.items(),
                           total=len(all_seq),
-                          desc="Pass 2: normalize+raster",
-                          unit="cat"):
+                          desc="Pass 2: normalize+rasterize",
+                          unit="cat",
+                          position=TOP_POS):
         tqdm.write(f"[Pass2][{cat}] {len(seqs)} sequences")
         args = [(s, std_dev, RASTER_IMG_SIZE) for s in seqs]
         t0   = time.time()
@@ -341,12 +361,15 @@ def main(categories_initial, raw_dir, proc_dir,
                     total=len(args),
                     desc=f"NR {cat}",
                     leave=False,
-                    position=0
+                    position=SUB_POS
                 ))
         else:
             results = [
                 normalize_and_rasterize(a)
-                for a in tqdm(args, desc=f"NR {cat}", leave=False, position=0)
+                for a in tqdm(args,
+                              desc=f"NR {cat}",
+                              leave=False,
+                              position=SUB_POS)
             ]
         dt    = time.time() - t0
         valid = [(n,i) for n,i in results if i is not None]
