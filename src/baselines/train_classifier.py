@@ -164,25 +164,29 @@ def main(args):
         print("Error: Number of classes is 0 or not determined. Check config or --num_classes argument.")
         return
 
-    input_channels_for_model = 1 # Default for training from scratch
-    raster_image_transform = None # Default: SketchDataset provides [1, H, W] tensor in [0,1]
+    input_channels_for_model = 1 
+    raster_image_transform = None 
     
     if args.use_pretrained:
         input_channels_for_model = 3 
         print("Using pretrained backbone. Data will be transformed to 3-channels and normalized.")
-        # Define transform to repeat channel and apply ImageNet normalization
-        # This transform will be passed to SketchDataset
         raster_image_transform = transforms.Compose([
-            transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.shape[0]==1 else x), # Repeat grayscale to 3 channels
+            transforms.ToTensor(),  # Convert PIL Image to Tensor FIRST
+            transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.shape[0]==1 and x.ndim==3 else x), # Repeat grayscale if 1 channel tensor
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
     else:
         print("Training backbone from scratch. Expecting 1-channel input to model.")
-        # If SketchDataset already provides a ToTensor() that scales to [0,1],
-        # no further specific transform is strictly needed here for the 1-channel case.
-        # If normalization or other transforms are desired for scratch training, add them here.
-        # For example, to normalize a 1-channel image:
-        # raster_image_transform = transforms.Normalize(mean=[0.5], std=[0.5])
+        # If SketchDataset outputs PIL, ToTensor is needed. If it outputs [0,1] tensor, this is fine.
+        # SketchDataset's default is ToTensor if no transform is passed.
+        # If you want to ensure it's a tensor for the scratch case too (if SketchDataset might not always do it):
+        # raster_image_transform = transforms.ToTensor() 
+        # Or if you want 1-channel normalization:
+        # raster_image_transform = transforms.Compose([
+        #     transforms.ToTensor(),
+        #     transforms.Normalize(mean=[0.5], std=[0.5])
+        # ])
+        pass # Assuming SketchDataset's default ToTensor is sufficient for 1-channel [0,1] tensor
 
 
     print(f"Initializing SketchDataset for training (split: {args.train_split})...")
@@ -193,7 +197,7 @@ def main(args):
         image_size=args.img_size,
         max_seq_len=args.max_seq_len, 
         config_filename=args.config_filename,
-        raster_transform=raster_image_transform # Pass the defined transform
+        raster_transform=raster_image_transform 
     )
     print(f"Initializing SketchDataset for validation (split: {args.val_split})...")
     val_dataset = SketchDataset(
@@ -203,7 +207,7 @@ def main(args):
         image_size=args.img_size,
         max_seq_len=args.max_seq_len,
         config_filename=args.config_filename,
-        raster_transform=raster_image_transform # Pass the defined transform
+        raster_transform=raster_image_transform 
     )
 
     if len(train_dataset) == 0 or len(val_dataset) == 0:
@@ -216,7 +220,7 @@ def main(args):
 
     model = SketchClassifier(
         num_classes=num_classes,
-        input_channels=input_channels_for_model, # Use this for model definition
+        input_channels=input_channels_for_model, 
         use_pretrained_backbone=args.use_pretrained,
         freeze_backbone=args.freeze_backbone
     ).to(device)
