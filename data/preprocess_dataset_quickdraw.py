@@ -14,18 +14,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from multiprocessing import Pool, cpu_count
 
 # --- Configuration ---
-BASE_DOWNLOAD_URL    = "https://storage.googleapis.com/quickdraw_dataset/full/simplified/"
-CATEGORIES_LIST_URL  = "https://raw.githubusercontent.com/googlecreativelab/quickdraw-dataset/master/categories.txt"
-DEFAULT_CATEGORIES   = ["cat","dog","apple","car","tree","house","bicycle","bird","face","airplane"]
-FALLBACK_CATEGORIES  = DEFAULT_CATEGORIES
-TRAIN_RATIO          = 0.80
-VAL_RATIO            = 0.10
-RASTER_IMG_SIZE      = 224
-CONFIG_FILENAME      = "quickdraw_config.json"
+BASE_DOWNLOAD_URL   = "https://storage.googleapis.com/quickdraw_dataset/full/simplified/"
+CATEGORIES_LIST_URL = "https://raw.githubusercontent.com/googlecreativelab/quickdraw-dataset/master/categories.txt"
+DEFAULT_CATEGORIES  = ["cat","dog","apple","car","tree","house","bicycle","bird","face","airplane"]
+FALLBACK_CATEGORIES = DEFAULT_CATEGORIES
+TRAIN_RATIO         = 0.80
+VAL_RATIO           = 0.10
+RASTER_IMG_SIZE     = 224
+CONFIG_FILENAME     = "quickdraw_config.json"
 
-SCRIPT_DIR           = os.path.dirname(os.path.abspath(__file__))
-RAW_DOWNLOAD_DIR     = os.path.join(SCRIPT_DIR, "..", "downloaded_data")
-PROCESSED_DATA_DIR   = os.path.join(SCRIPT_DIR, "..", "processed_data")
+SCRIPT_DIR         = os.path.dirname(os.path.abspath(__file__))
+RAW_DOWNLOAD_DIR   = os.path.join(SCRIPT_DIR, "..", "downloaded_data")
+PROCESSED_DATA_DIR = os.path.join(SCRIPT_DIR, "..", "processed_data")
 
 
 def download_all_categories_list(url=CATEGORIES_LIST_URL):
@@ -43,11 +43,12 @@ def download_all_categories_list(url=CATEGORIES_LIST_URL):
 
 
 def download_category_file(cat_name, target_dir, skip_download=False):
-    safe = cat_name.replace(" ", "%20")
+    safe    = cat_name.replace(" ", "%20")
     raw_dir = os.path.join(target_dir, "quickdraw_raw")
     os.makedirs(raw_dir, exist_ok=True)
     fname   = f"{cat_name}.ndjson"
     outpath = os.path.join(raw_dir, fname)
+
     if os.path.exists(outpath):
         return outpath, True
     if skip_download:
@@ -60,13 +61,12 @@ def download_category_file(cat_name, target_dir, skip_download=False):
         total = int(resp.headers.get("content-length", 0))
         with open(outpath, "wb") as f, tqdm(
             desc=f"Downloading {cat_name:20}",
-            total=total, unit="iB", unit_scale=True, leave=False
+            total=total, unit="iB", unit_scale=True, leave=False, position=0
         ) as bar:
             for chunk in resp.iter_content(4096):
-                if not chunk:
-                    continue
-                f.write(chunk)
-                bar.update(len(chunk))
+                if chunk:
+                    f.write(chunk)
+                    bar.update(len(chunk))
         return outpath, True
     except Exception:
         if os.path.exists(outpath):
@@ -74,11 +74,24 @@ def download_category_file(cat_name, target_dir, skip_download=False):
         return outpath, False
 
 
-def load_simplified_drawings(path, max_items=None):
+def load_simplified_drawings(path,
+                             max_items=None,
+                             desc=None,
+                             position=None):
+    """Wrap the file iterator in tqdm so you see a per-line progress bar."""
     drawings = []
     try:
         with open(path, "r", encoding="utf-8") as f:
-            for i, line in enumerate(f):
+            total = max_items
+            bar = tqdm(
+                f,
+                desc=desc or f"Loading {os.path.basename(path)}",
+                total=total,
+                unit="line",
+                leave=True,
+                position=position
+            )
+            for i, line in enumerate(bar):
                 if max_items is not None and i >= max_items:
                     break
                 try:
@@ -90,7 +103,7 @@ def load_simplified_drawings(path, max_items=None):
     except FileNotFoundError:
         pass
     except Exception as e:
-        print(f"Error loading {path}: {e}")
+        tqdm.write(f"Error loading {path}: {e}")
     return drawings
 
 
@@ -104,24 +117,24 @@ def convert_raw_sketch_to_delta_sequence(strokes):
         xs, ys = stroke
         if not xs or len(xs) != len(ys):
             continue
-        dx0 = xs[0] - lx; dy0 = ys[0] - ly
+        dx0, dy0 = xs[0] - lx, ys[0] - ly
         if si > 0:
             pts.append([dx0, dy0, 0, 1, 0])
             dx0, dy0 = 0, 0
         is_last = (si == n - 1 and len(xs) == 1)
-        state   = [0,0,1] if is_last else [1,0,0]
+        state   = [0, 0, 1] if is_last else [1, 0, 0]
         pts.append([dx0, dy0] + state)
         lx, ly = xs[0], ys[0]
         for i in range(1, len(xs)):
-            dx = xs[i] - lx; dy = ys[i] - ly
+            dx, dy = xs[i] - lx, ys[i] - ly
             lx, ly = xs[i], ys[i]
             is_last = (si == n - 1 and i == len(xs) - 1)
-            state   = [0,0,1] if is_last else [1,0,0]
+            state   = [0, 0, 1] if is_last else [1, 0, 0]
             pts.append([dx, dy] + state)
         if si < n - 1 and pts and pts[-1][4] == 0:
             pts[-1][2], pts[-1][3] = 0, 1
     if pts:
-        pts[-1][2:] = [0,0,1]
+        pts[-1][2:] = [0, 0, 1]
     return np.array(pts, dtype=np.float32)
 
 
@@ -153,12 +166,13 @@ def rasterize_sequence_to_pil_image(seq, size, thickness=2, pad=0.02):
         return img.convert("1")
     cw, ch = size*(1-2*pad), size*(1-2*pad)
     scale = min(cw/w if w>0 else 1, ch/h if h>0 else 1)
-    ox = (size - w*scale)/2
-    oy = (size - h*scale)/2
+    ox, oy = (size - w*scale)/2, (size - h*scale)/2
     for (ax, ay), (bx, by) in segs:
-        sx0 = (ax - minx)*scale + ox; sy0 = (ay - miny)*scale + oy
-        sx1 = (bx - minx)*scale + ox; sy1 = (by - miny)*scale + oy
-        draw.line([(sx0, sy0), (sx1, sy1)], fill="black", width=thickness)
+        sx0 = (ax - minx)*scale + ox
+        sy0 = (ay - miny)*scale + oy
+        sx1 = (bx - minx)*scale + ox
+        sy1 = (by - miny)*scale + oy
+        draw.line([(sx0, sy0), (sx1, sy1)], width=thickness, fill="black")
     return img.convert("1")
 
 
@@ -173,13 +187,32 @@ def normalize_and_rasterize(args):
         return None, None
 
 
+def download_and_load(cat, raw_dir, max_items, skip_download, position):
+    t0 = time.time()
+    path, ok = download_category_file(cat, raw_dir, skip_download)
+    dt_dl = time.time() - t0
+
+    draws = []
+    dt_ld = 0.0
+    if ok:
+        t1 = time.time()
+        draws = load_simplified_drawings(
+            path,
+            max_items=max_items,
+            desc=f"Loading {cat:20}",
+            position=position
+        )
+        dt_ld = time.time() - t1
+
+    return cat, ok, draws, dt_dl, dt_ld
+
+
 def main(categories_initial, raw_dir, proc_dir,
          train_r, val_r, max_items, skip_download, single_proc):
 
     use_parallel = not single_proc
     print(f"=== QuickDraw Preproc | parallel={'ON' if use_parallel else 'OFF'} | skip_download={skip_download} ===")
 
-    # prepare dirs
     vec_base   = os.path.join(proc_dir, "quickdraw_vector")
     ras_base   = os.path.join(proc_dir, "quickdraw_raster")
     raw_ndjson = os.path.join(raw_dir, "quickdraw_raw")
@@ -189,7 +222,7 @@ def main(categories_initial, raw_dir, proc_dir,
         os.makedirs(os.path.join(vec_base, sp), exist_ok=True)
         os.makedirs(os.path.join(ras_base, sp), exist_ok=True)
 
-    # determine categories
+    # pick categories
     if skip_download:
         existing = {f for f in os.listdir(raw_ndjson) if f.endswith(".ndjson")} if os.path.isdir(raw_ndjson) else set()
         cats     = [c for c in categories_initial if f"{c}.ndjson" in existing]
@@ -203,46 +236,52 @@ def main(categories_initial, raw_dir, proc_dir,
 
     print(f"Processing {len(cats)} categories: {cats}")
 
+    # ensure per-category raster dirs
     for sp in ("train", "val", "test"):
         for c in cats:
             os.makedirs(os.path.join(ras_base, sp, c), exist_ok=True)
 
     category_map = {c: i for i, c in enumerate(cats)}
 
-    # --- Download & load ---
+    # --- Download + Load in parallel ---
     all_sketches = {}
     if use_parallel:
-        nd_threads = 16
-        print(f"[Download] using {nd_threads} threads")
+        nd_threads = 8
+        print(f"[Download+Load] using {nd_threads} threads")
         with ThreadPoolExecutor(max_workers=nd_threads) as ex:
-            futures = {ex.submit(download_category_file, c, raw_dir, skip_download): c for c in cats}
-            for fut in tqdm(as_completed(futures), total=len(futures), desc="Downloading"):
-                cat = futures[fut]
-                t0  = time.time()
-                path, ok = fut.result()
-                dl_t = time.time() - t0
+            futures = {
+                ex.submit(download_and_load, c, raw_dir, max_items, skip_download, idx+1): c
+                for idx, c in enumerate(cats)
+            }
+            for fut in tqdm(as_completed(futures),
+                            total=len(futures),
+                            desc="Download+Load",
+                            position=0):
+                cat, ok, draws, dt_dl, dt_ld = fut.result()
                 if not ok:
-                    tqdm.write(f"→ skip '{cat}' (no file) in {dl_t:.2f}s")
+                    tqdm.write(f"→ skip '{cat}' (download fail) in {dt_dl:.2f}s")
                     continue
-                t1    = time.time()
-                draws = load_simplified_drawings(path, max_items)
-                ld_t  = time.time() - t1
-                tqdm.write(f"★ '{cat}': downloaded in {dl_t:.2f}s, loaded {len(draws)} sketches in {ld_t:.2f}s")
+                tqdm.write(f"★ '{cat}': downloaded in {dt_dl:.2f}s, loaded {len(draws)} sketches in {dt_ld:.2f}s")
                 if draws:
                     all_sketches[cat] = draws
     else:
-        print("[Download] single-process mode")
-        for cat in tqdm(cats, desc="Downloading"):
-            t0  = time.time()
+        print("[Download+Load] single-process mode")
+        for idx, cat in enumerate(tqdm(cats, desc="Download+Load", position=0)):
+            t0 = time.time()
             path, ok = download_category_file(cat, raw_dir, skip_download)
-            dl_t = time.time() - t0
+            dt_dl = time.time() - t0
             if not ok:
-                tqdm.write(f"→ skip '{cat}' (no file) in {dl_t:.2f}s")
+                tqdm.write(f"→ skip '{cat}' (download fail) in {dt_dl:.2f}s")
                 continue
-            t1    = time.time()
-            draws = load_simplified_drawings(path, max_items)
-            ld_t  = time.time() - t1
-            tqdm.write(f"★ '{cat}': downloaded in {dl_t:.2f}s, loaded {len(draws)} sketches in {ld_t:.2f}s")
+            t1 = time.time()
+            draws = load_simplified_drawings(
+                path,
+                max_items=max_items,
+                desc=f"Loading {cat:20}",
+                position=idx+1
+            )
+            dt_ld = time.time() - t1
+            tqdm.write(f"★ '{cat}': downloaded in {dt_dl:.2f}s, loaded {len(draws)} sketches in {dt_ld:.2f}s")
             if draws:
                 all_sketches[cat] = draws
 
@@ -262,18 +301,21 @@ def main(categories_initial, raw_dir, proc_dir,
         t0 = time.time()
         if use_parallel:
             with Pool(num_w) as p:
-                seqs = list(tqdm(p.imap(convert_raw_sketch_to_delta_sequence, draws),
-                                 total=len(draws),
-                                 desc=f"Δ→seq {cat}",
-                                 leave=False))
+                seqs = list(tqdm(
+                    p.imap(convert_raw_sketch_to_delta_sequence, draws),
+                    total=len(draws),
+                    desc=f"Δ→seq {cat}",
+                    leave=False,
+                    position=0
+                ))
         else:
-            seqs = [convert_raw_sketch_to_delta_sequence(d)
-                    for d in tqdm(draws,
-                                  desc=f"Δ→seq {cat}",
-                                  leave=False)]
-        dt = time.time() - t0
-        seqs = [s for s in seqs if s is not None and s.size > 0]
-        tqdm.write(f"[Pass1][{cat}] {len(seqs)} valid sequences in {dt:.2f}s")
+            seqs = [
+                convert_raw_sketch_to_delta_sequence(d)
+                for d in tqdm(draws, desc=f"Δ→seq {cat}", leave=False, position=0)
+            ]
+        dt    = time.time() - t0
+        seqs  = [s for s in seqs if s is not None and s.size > 0]
+        tqdm.write(f"[Pass1][{cat}] {len(seqs)} valid in {dt:.2f}s")
         all_seq[cat] = seqs
         ntr = int(train_r * len(seqs))
         for s in seqs[:ntr]:
@@ -283,7 +325,7 @@ def main(categories_initial, raw_dir, proc_dir,
     std_dev = max(std_dev, 1e-6)
     print(f"[Pass1] global std_dev = {std_dev:.6f}")
 
-    # --- Pass 2: normalize+raster ---
+    # --- Pass 2: normalize + rasterize ---
     print(f"[Pass 2] normalize+raster with {num_w} processes")
     for cat, seqs in tqdm(all_seq.items(),
                           total=len(all_seq),
@@ -294,15 +336,18 @@ def main(categories_initial, raw_dir, proc_dir,
         t0   = time.time()
         if use_parallel:
             with Pool(num_w) as p:
-                results = list(tqdm(p.imap(normalize_and_rasterize, args),
-                                    total=len(args),
-                                    desc=f"NR {cat}",
-                                    leave=False))
+                results = list(tqdm(
+                    p.imap(normalize_and_rasterize, args),
+                    total=len(args),
+                    desc=f"NR {cat}",
+                    leave=False,
+                    position=0
+                ))
         else:
-            results = [normalize_and_rasterize(a)
-                       for a in tqdm(args,
-                                     desc=f"NR {cat}",
-                                     leave=False)]
+            results = [
+                normalize_and_rasterize(a)
+                for a in tqdm(args, desc=f"NR {cat}", leave=False, position=0)
+            ]
         dt    = time.time() - t0
         valid = [(n,i) for n,i in results if i is not None]
         tqdm.write(f"[Pass2][{cat}] {len(valid)} rasters in {dt:.2f}s")
@@ -349,7 +394,7 @@ def main(categories_initial, raw_dir, proc_dir,
     with open(os.path.join(vec_base, CONFIG_FILENAME), "w") as f:
         json.dump(cfg, f, indent=4)
 
-    print(f"Done. Vectors @ {vec_base}, Rasters @ {ras_base}, Config → {CONFIG_FILENAME}")
+    print(f"Done! Vectors @ {vec_base}, Rasters @ {ras_base}, Config → {CONFIG_FILENAME}")
 
 
 if __name__ == "__main__":
@@ -380,7 +425,7 @@ if __name__ == "__main__":
         cats = sorted(DEFAULT_CATEGORIES)
 
     if args.max_categories is not None:
-        cats = cats[:args.max_categories]
+        cats = cats[: args.max_categories]
         print(f"Limiting to first {len(cats)} categories: {cats}")
 
     print(f"Raw dir:       {os.path.abspath(args.raw_dir)}")
