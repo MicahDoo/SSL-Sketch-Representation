@@ -32,7 +32,24 @@ SCRIPT_DIR           = os.path.dirname(os.path.abspath(__file__))
 RAW_DOWNLOAD_DIR     = os.path.join(SCRIPT_DIR, "..", "downloaded_data", "quickdraw_raw")
 PROCESSED_DATA_DIR   = os.path.join(SCRIPT_DIR, "..", "processed_data")
 
-# ─── THREAD‐SLOT ALLOCATOR ──────────────────────────────────────────────────────
+# ─── HELPER FUNCTIONS (Including the missing one) ───────────────────────────
+
+def download_all_categories_list(url=CATEGORIES_LIST_URL):
+    """Downloads the list of all categories from the given URL."""
+    print(f"Attempting to download category list from {url}...")
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        categories = [line.strip() for line in response.text.split('\n') if line.strip()]
+        if categories:
+            print(f"Successfully downloaded {len(categories)} category names.")
+            return sorted(categories) # Sort for consistency
+        else:
+            print("Downloaded category list is empty.")
+            return None
+    except requests.exceptions.RequestException as e:
+        print(f"Error downloading category list: {e}")
+        return None
 
 _thread_slots = {} 
 _slot_lock    = threading.Lock() 
@@ -43,8 +60,6 @@ def _get_thread_slot(max_slots: int) -> int:
         if tid not in _thread_slots:
             _thread_slots[tid] = len(_thread_slots) % max_slots
         return _thread_slots[tid]
-
-# ─── DOWNLOAD ONE ──────────────────────────────────────────────────────────────
 
 def download_one(cat_name: str, target_dir: str, max_slots: int):
     os.makedirs(target_dir, exist_ok=True) 
@@ -90,8 +105,6 @@ def download_one(cat_name: str, target_dir: str, max_slots: int):
     except Exception as e_gen: 
         print(f"Generic error for {cat_name} during download: {e_gen}")
         return output_path, False
-
-# ─── ITER & CONVERT ───────────────────────────────────────────────────────────
 
 def iter_drawings(path: str):
     with open(path, "r", encoding="utf-8") as f:
@@ -172,8 +185,6 @@ def rasterize_sequence_to_pil_image(normalized_delta_sequence, image_size: int,
     del draw_context
     return pil_image.convert("1") 
 
-# ─── PASS 1 & 2 (Moved to top level for pickling) ───────────────────────────
-
 def normalize_sequence_task(args_tuple):
     raw_strokes, global_std_dev = args_tuple
     try:
@@ -214,14 +225,12 @@ def run_pass1_for_category(cat_name, raw_dir, vec_base, std_dev, train_r, val_r,
     pool_processes = n_workers if n_workers and n_workers > 0 else 1
     
     if pool_processes == 1:
-        # print(f"  Running Pass 1 for {cat_name} in a single process.") # Less verbose
-        for task_args in tasks: # Removed inner tqdm
+        for task_args in tasks: 
             seq = normalize_sequence_task(task_args)
             if seq is not None: normalized_sequences.append(seq)
     else:
-        # print(f"  Running Pass 1 for {cat_name} with {pool_processes} workers.") # Less verbose
         with Pool(processes=pool_processes) as p:
-            results = list(p.imap(normalize_sequence_task, tasks, chunksize=max(1, len(tasks)//(pool_processes*4)))) # Removed inner tqdm
+            results = list(p.imap(normalize_sequence_task, tasks, chunksize=max(1, len(tasks)//(pool_processes*4)))) 
             normalized_sequences = [seq for seq in results if seq is not None]
 
     if not normalized_sequences:
@@ -241,7 +250,6 @@ def run_pass1_for_category(cat_name, raw_dir, vec_base, std_dev, train_r, val_r,
         if not seqs_in_split: continue
         out_path = os.path.join(vec_base, sp, f"{cat_name}.npy")
         np.save(out_path, np.array(seqs_in_split, dtype=object))
-
 
 def run_pass2_for_category(cat_name, vec_base, ras_base, img_size, n_workers):
     for sp in ("train","val","test"):
@@ -278,13 +286,12 @@ def run_pass2_for_category(cat_name, vec_base, ras_base, img_size, n_workers):
         
         pool_processes = n_workers if n_workers and n_workers > 0 else 1
         if pool_processes == 1:
-            for task_args in tasks: # Removed inner tqdm
+            for task_args in tasks: 
                 _rasterize_save_task(task_args)
         else:
             with Pool(processes=pool_processes) as p:
-                list(p.imap_unordered(_rasterize_save_task, tasks, chunksize=max(1, len(tasks)//(pool_processes*4)))) # Removed inner tqdm
+                list(p.imap_unordered(_rasterize_save_task, tasks, chunksize=max(1, len(tasks)//(pool_processes*4)))) 
     
-
 def process_category_task(args_bundle):
     cat_name, raw_dir, vec_base, ras_base, std_dev, train_r, val_r, n_workers, img_size, max_items_cat, progress_dict_cat = args_bundle
     current_progress = progress_dict_cat.get(cat_name, {})
@@ -300,7 +307,6 @@ def process_category_task(args_bundle):
         print(f"!!! Error processing category {cat_name} in worker {os.getpid()}: {e}")
         return cat_name, current_progress, str(e) 
 
-# ─── STATS (PROCESS‐BASED WITH PERSISTENT PROGRESS) ────────────────────────────
 _cat_slots_stats = {} 
 def init_stats_worker(cat_slots_arg): global _cat_slots_stats; _cat_slots_stats = cat_slots_arg
 def stats_for_category_task(args_tuple):
@@ -320,7 +326,7 @@ def stats_for_category_task(args_tuple):
 
 def merge_stats_parallel(stat_results_list):
     total_n, total_mean, total_M2 = 0.0, 0.0, 0.0
-    for cat_name, n_cat, mean_cat, M2_cat in stat_results_list: # Unpack cat_name here
+    for cat_name, n_cat, mean_cat, M2_cat in stat_results_list: 
         if n_cat == 0: continue 
         if total_n == 0: 
             total_n, total_mean, total_M2 = n_cat, mean_cat, M2_cat
@@ -355,7 +361,8 @@ def main():
 
     target_categories = []
     if args.all_categories:
-        downloaded_cats = download_all_categories_list()
+        # This is where download_all_categories_list is called
+        downloaded_cats = download_all_categories_list() 
         target_categories = downloaded_cats if downloaded_cats else FALLBACK_CATEGORIES
     elif args.categories: target_categories = sorted(list(set(args.categories)))
     else: target_categories = sorted(DEFAULT_CATEGORIES)
@@ -421,16 +428,11 @@ def main():
                     with open(stats_progress_file, "w") as f: json.dump(stats_progress, f, indent=2)
             
             all_cat_stats_for_merge = []
-            for cat_name_stat in target_categories: # Iterate over all target categories
-                if cat_name_stat in stats_progress: # Check if stats were computed/loaded
-                     # Ensure correct unpacking: stats_progress[cat_name_stat] is [n, mean, M2]
+            for cat_name_stat in target_categories: 
+                if cat_name_stat in stats_progress: 
                     all_cat_stats_for_merge.append(stats_progress[cat_name_stat])
-                # else:
-                    # print(f"Debug: Stats for {cat_name_stat} not found in stats_progress for merge.")
-
             if not all_cat_stats_for_merge: print("No stats to compute global std_dev.")
             else:
-                # Pass a list of [n, mean, M2] lists to merge_stats_parallel
                 total_n_all, _, total_M2_all = merge_stats_parallel(all_cat_stats_for_merge)
                 if total_n_all > 1: global_std_dev = float(np.sqrt(total_M2_all / (total_n_all - 1)))
                 global_std_dev = max(global_std_dev, 1e-6)
@@ -488,7 +490,6 @@ def main():
                     executor.submit(process_category_task, task_args): task_args[0] 
                     for task_args in tasks_for_processing_stage
                 }
-                # This is the main overall progress bar for the "process" stage
                 for future in tqdm(as_completed(future_to_cat_process), total=len(tasks_for_processing_stage), desc="Overall Category Processing"):
                     cat_name_completed = future_to_cat_process[future]
                     try:
@@ -499,7 +500,6 @@ def main():
                             process_progress[returned_cat_name] = updated_cat_prog
                             with open(process_stage_progress_file, "w") as f:
                                 json.dump(process_progress, f, indent=2)
-                            # print(f"→ Completed processing for '{returned_cat_name}'") # Less verbose
                     except Exception as exc:
                         print(f"Exception for category '{cat_name_completed}' during processing stage: {exc}")
         if args.step == "process": return
