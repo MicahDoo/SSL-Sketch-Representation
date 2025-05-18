@@ -256,7 +256,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate.')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay for optimizer.')
     parser.add_argument('--lr_patience', type=int, default=3, help='Patience for ReduceLROnPlateau scheduler.')
-    parser.add_argument('--num_workers', type=int, default=2, help='Number of workers for DataLoader.')
+    parser.add_argument('--num_workers', type=int, default=4, help='Number of workers for DataLoader.')
     parser.add_argument('--use_gpu', action='store_true', help='Use GPU if available.')
     args = parser.parse_args()
     
