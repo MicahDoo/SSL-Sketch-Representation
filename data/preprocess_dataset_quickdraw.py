@@ -1,4 +1,6 @@
+#!/usr/bin/env python3
 # data/preprocess_dataset_quickdraw.py
+
 import os
 import json
 import random
@@ -6,9 +8,10 @@ import argparse
 import numpy as np
 import requests
 from tqdm import tqdm
-from PIL import Image, ImageDraw 
-import multiprocessing # Re-added for parallel processing
-import traceback # For detailed error logging
+from PIL import Image, ImageDraw
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from multiprocessing import Pool, cpu_count
 
 # --- Configuration ---
 BASE_DOWNLOAD_URL = "https://storage.googleapis.com/quickdraw_dataset/full/simplified/"
@@ -20,16 +23,16 @@ FALLBACK_CATEGORIES = DEFAULT_CATEGORIES
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RAW_DOWNLOAD_DIR_ROOT = os.path.join(SCRIPT_DIR, "..", "downloaded_data")
-PROCESSED_DATA_DIR_ROOT = os.path.join(SCRIPT_DIR, "..", "processed_data") 
+PROCESSED_DATA_DIR_ROOT = os.path.join(SCRIPT_DIR, "..", "processed_data")
 
 TRAIN_RATIO = 0.80
-VAL_RATIO = 0.10 
-RASTER_IMG_SIZE = 224 
+VAL_RATIO   = 0.10
+RASTER_IMG_SIZE = 224
 CONFIG_FILENAME = "quickdraw_config.json"
 
-# --- Helper Functions --- 
+# --- Helper Functions (unchanged) ---
 def download_all_categories_list(url=CATEGORIES_LIST_URL):
-    print(f"Attempting to download category list from {url}...") 
+    print(f"Attempting to download category list from {url}...")
     try:
         response = requests.get(url)
         response.raise_for_status()
@@ -52,427 +55,313 @@ def download_category_file(category_name, target_dir, skip_actual_download=False
 
     if os.path.exists(target_path):
         return target_path, True
-    
+
     if skip_actual_download:
-        print(f"File '{file_name}' not found locally and --skip_raw_download is set. Download will be skipped.")
+        print(f"File '{file_name}' not found locally and --skip_raw_download is set. Skipping download.")
         return target_path, False
 
     try:
         response = requests.get(url, stream=True)
         response.raise_for_status()
         with open(target_path, 'wb') as f, tqdm(
-            desc=f"Downloading {category_name[:20]}...",
+            desc=f"Downloading {category_name[:20]:20}",
             total=int(response.headers.get('content-length', 0)),
             unit='iB', unit_scale=True, unit_divisor=1024, leave=False
         ) as bar:
             for chunk in response.iter_content(chunk_size=4096):
-                if chunk: f.write(chunk); bar.update(len(chunk))
+                if chunk:
+                    f.write(chunk)
+                    bar.update(len(chunk))
         return target_path, True
-    except requests.exceptions.RequestException:
-        if os.path.exists(target_path): os.remove(target_path)
+    except Exception:
+        if os.path.exists(target_path):
+            os.remove(target_path)
         return target_path, False
-
-# Helper for multiprocessing load_simplified_drawings
-def load_simplified_drawings_mp_helper(args_tuple):
-    ndjson_path, max_items = args_tuple
-    # pid = os.getpid() # Get current process ID
-    # print(f"[Worker PID: {pid}] Loading drawings from: {os.path.basename(ndjson_path)} (max_items: {max_items})")
-    try:
-        result = load_simplified_drawings(ndjson_path, max_items)
-        # print(f"[Worker PID: {pid}] Finished loading {len(result)} drawings from: {os.path.basename(ndjson_path)}")
-        return result
-    except Exception as e:
-        # print(f"[Worker PID: {pid}] ERROR loading drawings from {os.path.basename(ndjson_path)}: {e}")
-        # print(traceback.format_exc())
-        return [] # Return empty list on error
 
 def load_simplified_drawings(ndjson_path, max_items_per_category=None):
     drawings = []
     try:
         with open(ndjson_path, 'r', encoding='utf-8') as f:
             for i, line in enumerate(f):
-                if max_items_per_category is not None and i >= max_items_per_category: break
+                if max_items_per_category is not None and i >= max_items_per_category:
+                    break
                 try:
                     obj = json.loads(line)
-                    if obj.get('recognized', False): drawings.append(obj['drawing'])
-                except (json.JSONDecodeError, KeyError): pass
-    except FileNotFoundError: 
-        print(f"Warning: File not found during load: {ndjson_path}. Skipping category.")
-        return [] 
-    except Exception as e: print(f"Error reading file {ndjson_path}: {e}")
+                    if obj.get('recognized', False):
+                        drawings.append(obj['drawing'])
+                except:
+                    continue
+    except FileNotFoundError:
+        print(f"Warning: File not found during load: {ndjson_path}. Skipping.")
+    except Exception as e:
+        print(f"Error reading {ndjson_path}: {e}")
     return drawings
 
-def convert_raw_sketch_to_delta_sequence_mp_helper(raw_sketch_strokes_with_id):
-    """Helper for multiprocessing, calls the main conversion function and adds error handling."""
-    # raw_sketch_strokes_with_id could be a tuple (original_index, raw_sketch_strokes) if you need to track
-    # For now, assume it's just raw_sketch_strokes
-    # pid = os.getpid()
-    # print(f"[Worker PID: {pid}] Starting delta conversion for a sketch...")
-    try:
-        result = convert_raw_sketch_to_delta_sequence(raw_sketch_strokes_with_id) # Pass raw_sketch_strokes directly
-        if result.size == 0 : 
-            # print(f"[Worker PID: {pid}] Delta conversion resulted in empty sequence.")
-            return None
-        # print(f"[Worker PID: {pid}] Finished delta conversion successfully.")
-        return result
-    except Exception as e:
-        # pid_err = os.getpid()
-        # print(f"[Worker PID: {pid_err}] ERROR during delta conversion: {e}")
-        # print(traceback.format_exc()) 
-        return None 
-
 def convert_raw_sketch_to_delta_sequence(raw_sketch_strokes):
-    points = []
-    last_x, last_y = 0, 0
+    points = []; last_x, last_y = 0, 0
     num_strokes = len(raw_sketch_strokes)
-    if num_strokes == 0: return np.zeros((0,5), dtype=np.float32) 
+    if num_strokes == 0:
+        return np.zeros((0,5), dtype=np.float32)
     for stroke_idx, stroke in enumerate(raw_sketch_strokes):
         xs, ys = stroke
-        if not xs or len(xs) != len(ys): continue 
+        if not xs or len(xs) != len(ys):
+            continue
         dx0 = xs[0] - last_x; dy0 = ys[0] - last_y
-        if stroke_idx > 0: points.append([dx0, dy0, 0, 1, 0]); dx0, dy0 = 0, 0
-        is_last_point_in_sketch = (stroke_idx == num_strokes - 1) and (len(xs) == 1)
-        p_state = [0,0,1] if is_last_point_in_sketch else [1,0,0]
+        if stroke_idx > 0:
+            points.append([dx0, dy0, 0, 1, 0])
+            dx0, dy0 = 0, 0
+        is_last = (stroke_idx == num_strokes - 1) and (len(xs) == 1)
+        p_state = [0,0,1] if is_last else [1,0,0]
         points.append([dx0, dy0] + p_state)
         last_x, last_y = xs[0], ys[0]
         for i in range(1, len(xs)):
             dx = xs[i] - last_x; dy = ys[i] - last_y
             last_x, last_y = xs[i], ys[i]
-            is_last_point_in_sketch = (stroke_idx == num_strokes - 1) and (i == len(xs) - 1)
-            p_state = [0,0,1] if is_last_point_in_sketch else [1,0,0]
+            is_last = (stroke_idx == num_strokes - 1) and (i == len(xs) - 1)
+            p_state = [0,0,1] if is_last else [1,0,0]
             points.append([dx, dy] + p_state)
-        if stroke_idx < num_strokes - 1:
-            if points and points[-1][4] == 0: 
-                points[-1][2] = 0; points[-1][3] = 1
-    if points: 
-        points[-1][2] = 0; points[-1][3] = 0; points[-1][4] = 1 
+        if stroke_idx < num_strokes - 1 and points and points[-1][4] == 0:
+            points[-1][2], points[-1][3] = 0, 1
+    if points:
+        points[-1][2:] = [0, 0, 1]
     return np.array(points, dtype=np.float32)
 
-def rasterize_sequence_to_pil_image(normalized_vector_sequence_np, image_size, line_thickness_raster=2, padding_percent_raster=0.02):
-    image = Image.new("L", (image_size, image_size), "white") 
+def rasterize_sequence_to_pil_image(seq, image_size, line_thickness=2, padding=0.02):
+    image = Image.new("L", (image_size, image_size), "white")
     draw = ImageDraw.Draw(image)
-    abs_segments = [] 
-    current_abs_x, current_abs_y = 0.0, 0.0
-    for i in range(normalized_vector_sequence_np.shape[0]):
-        dx, dy, p_down, p_up, p_eos = normalized_vector_sequence_np[i]
-        next_abs_x, next_abs_y = current_abs_x + dx, current_abs_y + dy
-        if p_down > 0.5:
-             if i > 0 : 
-                 abs_segments.append(((current_abs_x, current_abs_y), (next_abs_x, next_abs_y)))
-        current_abs_x, current_abs_y = next_abs_x, next_abs_y
-        if p_eos > 0.5: break
-    if not abs_segments: return image.convert("1")
-    all_x_coords = [p[0][0] for p in abs_segments] + [p[1][0] for p in abs_segments]
-    all_y_coords = [p[0][1] for p in abs_segments] + [p[1][1] for p in abs_segments]
-    if not all_x_coords or not all_y_coords: return image.convert("1")
-    min_x, max_x = min(all_x_coords), max(all_x_coords)
-    min_y, max_y = min(all_y_coords), max(all_y_coords)
-    sketch_width = max_x - min_x; sketch_height = max_y - min_y
-    if sketch_width < 1e-6 and sketch_height < 1e-6: 
-        if abs_segments:
-             pt_x = (abs_segments[0][0][0] - min_x); pt_y = (abs_segments[0][0][1] - min_y) 
-             draw_x = image_size / 2 + pt_x; draw_y = image_size / 2 + pt_y
-             draw.ellipse([(draw_x-1, draw_y-1), (draw_x+1, draw_y+1)], fill="black")
+    abs_segs = []; x0 = y0 = 0.0
+    for dx, dy, p_down, p_up, p_eos in seq:
+        x1, y1 = x0 + dx, y0 + dy
+        if p_down > 0.5 and (x0, y0) != (0,0):
+            abs_segs.append(((x0,y0),(x1,y1)))
+        x0, y0 = x1, y1
+        if p_eos > 0.5:
+            break
+    if not abs_segs:
         return image.convert("1")
-    canvas_draw_area_width = image_size * (1 - 2 * padding_percent_raster)
-    canvas_draw_area_height = image_size * (1 - 2 * padding_percent_raster)
-    scale_factor = 1.0
-    if sketch_width > 1e-6: scale_factor = canvas_draw_area_width / sketch_width
-    if sketch_height > 1e-6: scale_factor = min(scale_factor, canvas_draw_area_height / sketch_height)
-    offset_x_canvas = (image_size - (sketch_width * scale_factor)) / 2.0
-    offset_y_canvas = (image_size - (sketch_height * scale_factor)) / 2.0
-    for p1_abs, p2_abs in abs_segments:
-        x1 = ((p1_abs[0] - min_x) * scale_factor) + offset_x_canvas
-        y1 = ((p1_abs[1] - min_y) * scale_factor) + offset_y_canvas
-        x2 = ((p2_abs[0] - min_x) * scale_factor) + offset_x_canvas
-        y2 = ((p2_abs[1] - min_y) * scale_factor) + offset_y_canvas
-        draw.line([(x1, y1), (x2, y2)], fill="black", width=line_thickness_raster)
-    del draw
+    xs = [p[0][0] for p in abs_segs] + [p[1][0] for p in abs_segs]
+    ys = [p[0][1] for p in abs_segs] + [p[1][1] for p in abs_segs]
+    if not xs or not ys:
+        return image.convert("1")
+    minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
+    w, h = maxx-minx, maxy-miny
+    if w < 1e-6 and h < 1e-6:
+        mx, my = abs_segs[0][0]
+        cx = image_size/2 + (mx-minx)
+        cy = image_size/2 + (my-miny)
+        draw.ellipse([(cx-1,cy-1),(cx+1,cy+1)], fill="black")
+        return image.convert("1")
+    canvas_w = image_size*(1-2*padding)
+    canvas_h = image_size*(1-2*padding)
+    scale = min(canvas_w/w if w>0 else 1, canvas_h/h if h>0 else 1)
+    offx = (image_size - w*scale)/2
+    offy = (image_size - h*scale)/2
+    for (x0,y0),(x1,y1) in abs_segs:
+        sx0 = (x0-minx)*scale + offx
+        sy0 = (y0-miny)*scale + offy
+        sx1 = (x1-minx)*scale + offx
+        sy1 = (y1-miny)*scale + offy
+        draw.line([(sx0,sy0),(sx1,sy1)], fill="black", width=line_thickness)
     return image.convert("1")
 
-# Helper function for Pass 2 parallel processing
-def normalize_and_rasterize_mp_helper(args_tuple):
-    seq_array, std_dev_val, raster_img_size_val = args_tuple
-    # pid = os.getpid()
-    # print(f"[Worker PID: {pid}] Normalizing and rasterizing a sequence...")
+def normalize_and_rasterize(args):
+    seq_array, std_dev, img_size = args
     try:
-        norm_seq = seq_array.copy()
-        norm_seq[:, :2] /= std_dev_val
-        pil_img = rasterize_sequence_to_pil_image(norm_seq, raster_img_size_val)
-        # print(f"[Worker PID: {pid}] Finished normalizing and rasterizing.")
-        return norm_seq, pil_img
-    except Exception as e:
-        # pid_err = os.getpid()
-        # print(f"[Worker PID: {pid_err}] ERROR during normalize/rasterize: {e}")
-        # print(traceback.format_exc())
-        return None, None 
+        norm = seq_array.copy()
+        norm[:, :2] /= std_dev
+        pil = rasterize_sequence_to_pil_image(norm, img_size)
+        return norm, pil
+    except Exception:
+        return None, None
 
-def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param, train_r, val_r, max_items_cat, skip_raw_download_flag, num_workers_preprocess):
-    print(f"--- Starting QuickDraw Preprocessing for initially {len(categories_to_process_initial)} target categories ---")
-    if skip_raw_download_flag:
-        print("!!! --skip_raw_download flag is active. Will only process locally existing .ndjson files. !!!")
-    if max_items_cat: print(f"Max items per category: {max_items_cat}.")
-    
-    pool_processes = None 
-    actual_workers_to_be_used = 0
+# --- Main (parallelized) ---
+def main(categories_initial, raw_dir, proc_dir, train_r, val_r, max_items, skip_raw_download):
+    print(f"--- Starting QuickDraw Preprocessing ({'skip_download' if skip_raw_download else 'full_download'}) ---")
+    if skip_raw_download:
+        print("!!! --skip_raw_download is active: only processing existing .ndjson files. !!!")
+    if max_items:
+        print(f"Max items per category: {max_items}")
 
-    if num_workers_preprocess is not None and num_workers_preprocess <= 0:
-        pool_processes = 1 
-        actual_workers_to_be_used = 1
-        print(f"Using {actual_workers_to_be_used} worker process for CPU-bound tasks (num_workers_preprocess <= 0).")
-    elif num_workers_preprocess is not None:
-        pool_processes = num_workers_preprocess
-        actual_workers_to_be_used = pool_processes
-        print(f"Using {actual_workers_to_be_used} worker processes for CPU-bound tasks.")
-    else: 
-        try:
-            cpu_count = os.cpu_count()
-            if cpu_count:
-                actual_workers_to_be_used = min(max(1, cpu_count // 2), 8) 
-                pool_processes = actual_workers_to_be_used 
-                print(f"Using {actual_workers_to_be_used} (half of available CPUs, capped at 8) worker processes for CPU-bound tasks.")
-            else:
-                print("os.cpu_count() returned None. Defaulting to 2 worker processes.")
-                pool_processes = 2; actual_workers_to_be_used = 2
-        except NotImplementedError:
-            print("Warning: os.cpu_count() is not available. Defaulting to 2 worker processes.")
-            pool_processes = 2; actual_workers_to_be_used = 2
+    # Prepare dirs
+    vector_dir = os.path.join(proc_dir, "quickdraw_vector")
+    raster_dir = os.path.join(proc_dir, "quickdraw_raster")
+    raw_ndjson_dir = os.path.join(raw_dir, "quickdraw_raw")
+    os.makedirs(vector_dir, exist_ok=True)
+    os.makedirs(raster_dir, exist_ok=True)
+    for split in ("train","val","test"):
+        os.makedirs(os.path.join(vector_dir, split), exist_ok=True)
+        os.makedirs(os.path.join(raster_dir, split), exist_ok=True)
 
-    vector_proc_base = os.path.join(processed_dir_base_param, "quickdraw_vector")
-    raster_proc_base = os.path.join(processed_dir_base_param, "quickdraw_raster")
-    raw_ndjson_dir_path = os.path.join(raw_dir_param, "quickdraw_raw") 
-    
-    os.makedirs(vector_proc_base, exist_ok=True)
-    os.makedirs(raster_proc_base, exist_ok=True)
-    for split in ("train", "val", "test"):
-        os.makedirs(os.path.join(vector_proc_base, split), exist_ok=True)
-        os.makedirs(os.path.join(raster_proc_base, split), exist_ok=True)
-
-    categories_to_actually_process = []
-    if skip_raw_download_flag:
-        print(f"Scanning {raw_ndjson_dir_path} for existing .ndjson files...")
-        if os.path.isdir(raw_ndjson_dir_path):
-            existing_ndjson_files = {f for f in os.listdir(raw_ndjson_dir_path) if f.endswith(".ndjson")}
-            for cat_name in categories_to_process_initial:
-                if f"{cat_name}.ndjson" in existing_ndjson_files:
-                    categories_to_actually_process.append(cat_name)
-            if not categories_to_actually_process and categories_to_process_initial:
-                print(f"Warning: --skip_raw_download is set, but no .ndjson files found in {raw_ndjson_dir_path} for the target categories.")
-            elif categories_to_actually_process:
-                 print(f"Found {len(categories_to_actually_process)} categories locally. Will process only these.")
-        else:
-            print(f"Warning: --skip_raw_download is set, but raw directory {raw_ndjson_dir_path} not found.")
-        if not categories_to_actually_process: 
-             print("No local files found for the specified categories. No categories will be processed.")
-             return 
+    # Determine which categories to process
+    if skip_raw_download:
+        existing = set(f for f in os.listdir(raw_ndjson_dir) if f.endswith(".ndjson")) if os.path.isdir(raw_ndjson_dir) else set()
+        cats = [c for c in categories_initial if f"{c}.ndjson" in existing]
+        if not cats:
+            print(f"No local .ndjson found in {raw_ndjson_dir} for requested categories. Exiting.")
+            return
+        categories = cats
     else:
-        categories_to_actually_process = categories_to_process_initial
+        categories = categories_initial
 
-    if not categories_to_actually_process:
-        print("No categories to process. Exiting.")
-        return
-    
-    print(f"Final list of categories to process: {len(categories_to_actually_process)}")
-    for split in ("train", "val", "test"):
-        for cat_name in categories_to_actually_process:
-             os.makedirs(os.path.join(raster_proc_base, split, cat_name), exist_ok=True)
+    if not categories:
+        print("No categories to process. Exiting."); return
 
-    category_map = {}
-    load_drawing_tasks = []
-    print("\n--- Preparing tasks for loading raw drawings ---")
-    for idx, cat_name in enumerate(tqdm(categories_to_actually_process, desc="Checking files & preparing load tasks")):
-        category_map[cat_name] = idx 
-        ndjson_path, ok = download_category_file(cat_name, raw_dir_param, skip_actual_download=skip_raw_download_flag)
-        if not ok: 
-            print(f"  -> Critical: Skipping '{cat_name}' (file check failed unexpectedly or download failed).")
+    print(f"Final list of categories ({len(categories)}): {categories}")
+
+    # Pre-create per-category raster dirs
+    for split in ("train","val","test"):
+        for c in categories:
+            os.makedirs(os.path.join(raster_dir, split, c), exist_ok=True)
+
+    # Build category map
+    category_map = {c:i for i,c in enumerate(categories)}
+
+    # --- Parallel download & load ---
+    all_sketches = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(download_category_file, c, raw_dir, skip_raw_download): c
+            for c in categories
+        }
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Downloading"):
+            cat = futures[fut]
+            try:
+                path, ok = fut.result()
+                if not ok:
+                    print(f"  -> Skipping '{cat}' (download/file error).")
+                    continue
+                drawings = load_simplified_drawings(path, max_items_per_category=max_items)
+                if drawings:
+                    all_sketches[cat] = drawings
+                else:
+                    print(f"  -> No valid drawings for '{cat}'.")
+            except Exception as e:
+                print(f"  -> Unexpected error for '{cat}': {e}")
+
+    if not all_sketches:
+        print("No sketches loaded. Aborting."); return
+
+    # --- Pass 1: convert to delta sequences in parallel ---
+    num_workers = max(1, cpu_count()//2)
+    all_seq = {}
+    train_deltas = []
+    for cat, drawings in all_sketches.items():
+        with Pool(num_workers) as pool:
+            seqs = list(tqdm(
+                pool.imap(convert_raw_sketch_to_delta_sequence, drawings),
+                total=len(drawings),
+                desc=f"Δ→seq ({cat})"
+            ))
+        seqs = [s for s in seqs if s is not None and s.size>0]
+        all_seq[cat] = seqs
+        # collect for std dev
+        n_train = int(train_r * len(seqs))
+        for seq in seqs[:n_train]:
+            train_deltas.extend(seq[:,0])
+            train_deltas.extend(seq[:,1])
+
+    std_dev = float(np.std(train_deltas)) if train_deltas else 1.0
+    std_dev = max(std_dev, 1e-6)
+    print(f"Computed global std_dev = {std_dev:.6f}")
+
+    # --- Pass 2: normalize + rasterize in parallel, then split & save ---
+    for cat, seqs in all_seq.items():
+        args = [(seq, std_dev, RASTER_IMG_SIZE) for seq in seqs]
+        with Pool(num_workers) as pool:
+            results = list(tqdm(
+                pool.imap(normalize_and_rasterize, args),
+                total=len(args),
+                desc=f"Norm+Raster ({cat})"
+            ))
+        valid = [(n, img) for n, img in results if img is not None]
+        if not valid:
+            print(f"  -> No valid raster results for '{cat}'. Skipping.")
             continue
-        load_drawing_tasks.append((cat_name, ndjson_path, max_items_cat))
 
-    all_sketches_by_cat = {}
-    if load_drawing_tasks:
-        print(f"\n--- Loading drawings for {len(load_drawing_tasks)} categories ---")
-        if pool_processes == 1:
-            print("  Executing drawing loading in a single process.")
-            for cat_name, ndjson_path, max_items in tqdm(load_drawing_tasks, desc="Loading Drawings (Single Proc)"):
-                drawings = load_simplified_drawings(ndjson_path, max_items)
-                if drawings: all_sketches_by_cat[cat_name] = drawings
-                else: print(f"  -> No valid drawings loaded for '{cat_name}'.")
-        else:
-            print(f"  Executing drawing loading with a pool of {actual_workers_to_be_used} processes.")
-            map_args = [(task[1], task[2]) for task in load_drawing_tasks] 
-            chunk_size_load = max(1, len(map_args) // (actual_workers_to_be_used * 4)) if actual_workers_to_be_used > 0 else 1
-            with multiprocessing.Pool(processes=pool_processes) as pool:
-                results_drawings_lists = list(tqdm(pool.imap(load_simplified_drawings_mp_helper, map_args, chunksize=chunk_size_load), 
-                                                   total=len(map_args), desc="Loading Drawings (Multi Proc)"))
-            for i, (cat_name, _, _) in enumerate(load_drawing_tasks):
-                drawings = results_drawings_lists[i]
-                if drawings: all_sketches_by_cat[cat_name] = drawings
-                else: print(f"  -> No valid drawings loaded for '{cat_name}' (from parallel load).")
-    
-    if not all_sketches_by_cat:
-        print("No sketches loaded for any category. Aborting further processing.")
-        return
+        vecs, imgs = zip(*valid)
+        combined = list(zip(vecs, imgs))
+        random.shuffle(combined)
+        vecs, imgs = zip(*combined)
+        total = len(vecs)
+        n_train = int(train_r * total)
+        n_val   = int(val_r * total)
+        splits = {
+            "train": (vecs[:n_train], imgs[:n_train]),
+            "val":   (vecs[n_train:n_train+n_val], imgs[n_train:n_train+n_val]),
+            "test":  (vecs[n_train+n_val:], imgs[n_train+n_val:])
+        }
+        for split, (vseqs, rimgs) in splits.items():
+            if not vseqs:
+                continue
+            # save vectors
+            vec_path = os.path.join(vector_dir, split, f"{cat}.npy")
+            np.save(vec_path, np.array(vseqs, dtype=object))
+            # save rasters
+            out_dir = os.path.join(raster_dir, split, cat)
+            for i, im in enumerate(rimgs):
+                im.save(os.path.join(out_dir, f"sketch_{i:05d}.png"))
 
-    print("\n--- Pass 1: Converting & Calculating StdDev ---")
-    all_train_candidate_deltas = []
-    all_processed_sketches_by_cat = {}
-    
-    if pool_processes == 1: 
-        print("  Executing Pass 1 conversions in a single process.")
-        for cat_name, raw_drawings in tqdm(all_sketches_by_cat.items(), desc="Pass 1 Processing (Single Proc)"):
-            processed_sequences_for_cat = []
-            for sketch_drawing in raw_drawings:
-                seq = convert_raw_sketch_to_delta_sequence_mp_helper(sketch_drawing)
-                if seq is not None and seq.size > 0: 
-                    processed_sequences_for_cat.append(seq)
-            if not processed_sequences_for_cat: print(f"No valid sequences for '{cat_name}'."); continue
-            all_processed_sketches_by_cat[cat_name] = processed_sequences_for_cat
-            random.shuffle(processed_sequences_for_cat)
-            n_train_cat = int(train_r * len(processed_sequences_for_cat))
-            for seq_array in processed_sequences_for_cat[:n_train_cat]:
-                all_train_candidate_deltas.extend(seq_array[:,0]); all_train_candidate_deltas.extend(seq_array[:,1])
-    else: 
-        print(f"  Executing Pass 1 conversions with a pool of {actual_workers_to_be_used} processes.")
-        with multiprocessing.Pool(processes=pool_processes) as pool: 
-            for cat_name, raw_drawings in tqdm(all_sketches_by_cat.items(), desc="Pass 1 Processing (Multi Proc)"):
-                chunk_size = max(1, len(raw_drawings) // (actual_workers_to_be_used * 4)) if actual_workers_to_be_used > 0 else 1
-                # Pass raw_drawings directly to the helper, which calls the main conversion function
-                results = pool.map(convert_raw_sketch_to_delta_sequence_mp_helper, raw_drawings, chunksize=chunk_size)
-                processed_sequences_for_cat = [seq for seq in results if seq is not None and seq.size > 0] 
-                if not processed_sequences_for_cat: print(f"No valid sequences for '{cat_name}'."); continue
-                all_processed_sketches_by_cat[cat_name] = processed_sequences_for_cat
-                random.shuffle(processed_sequences_for_cat)
-                n_train_cat = int(train_r * len(processed_sequences_for_cat))
-                for seq_array in processed_sequences_for_cat[:n_train_cat]:
-                    all_train_candidate_deltas.extend(seq_array[:,0]); all_train_candidate_deltas.extend(seq_array[:,1])
-
-    if not all_train_candidate_deltas: std_dev = 1.0; print("Warning: No deltas; std_dev=1.0")
-    else: std_dev = float(np.std(all_train_candidate_deltas)); std_dev = max(std_dev, 1e-6) 
-    print(f"Global std_dev = {std_dev:.4f}")
-
-    print("\n--- Pass 2: Normalizing, Rasterizing, Splitting, Saving ---")
-    
-    if pool_processes == 1:
-        print("  Executing Pass 2 (Normalize & Rasterize) in a single process.")
-        for cat_name, processed_sequences in tqdm(all_processed_sketches_by_cat.items(), desc="Pass 2 (Single Proc)"):
-            norm_and_raster_results = []
-            for seq_array in processed_sequences:
-                norm_seq, pil_img = normalize_and_rasterize_mp_helper((seq_array, std_dev, RASTER_IMG_SIZE))
-                if pil_img is not None: 
-                    norm_and_raster_results.append((norm_seq, pil_img))
-            
-            if not norm_and_raster_results: continue 
-            normalized_vector_sequences, raster_images_for_cat = zip(*norm_and_raster_results)
-            combined = list(zip(normalized_vector_sequences, raster_images_for_cat))
-            random.shuffle(combined)
-            shuffled_vectors, shuffled_rasters = zip(*combined) if combined else ([], [])
-            n_total = len(shuffled_vectors)
-            n_train = int(train_r * n_total); n_val = int(val_r * n_total)
-            splits_vector = {"train": list(shuffled_vectors[:n_train]), "val": list(shuffled_vectors[n_train : n_train + n_val]), "test": list(shuffled_vectors[n_train + n_val:])}
-            splits_raster = {"train": list(shuffled_rasters[:n_train]), "val": list(shuffled_rasters[n_train : n_train + n_val]), "test": list(shuffled_rasters[n_train + n_val:])}
-            for split_name in ["train", "val", "test"]:
-                vector_split_data = splits_vector[split_name]; raster_split_data = splits_raster[split_name]
-                if not vector_split_data: continue
-                vector_out_path = os.path.join(vector_proc_base, split_name, f"{cat_name}.npy")
-                np.save(vector_out_path, np.array(vector_split_data, dtype=object))
-                raster_cat_split_dir = os.path.join(raster_proc_base, split_name, cat_name)
-                for i, pil_img in enumerate(raster_split_data):
-                    if pil_img is not None: 
-                        img_filename = f"sketch_{i:05d}.png"
-                        pil_img.save(os.path.join(raster_cat_split_dir, img_filename))
-    else: 
-        print(f"  Executing Pass 2 (Normalize & Rasterize) with a pool of {actual_workers_to_be_used} processes.")
-        with multiprocessing.Pool(processes=pool_processes) as pool: 
-            for cat_name, processed_sequences in tqdm(all_processed_sketches_by_cat.items(), desc="Pass 2 (Multi Proc)"):
-                tasks = [(seq, std_dev, RASTER_IMG_SIZE) for seq in processed_sequences]
-                chunk_size_pass2 = max(1, len(tasks) // (actual_workers_to_be_used * 4)) if actual_workers_to_be_used > 0 else 1
-                norm_and_raster_results_mp = pool.map(normalize_and_rasterize_mp_helper, tasks, chunksize=chunk_size_pass2)
-                
-                valid_results = [res for res in norm_and_raster_results_mp if res[0] is not None and res[1] is not None]
-                if not valid_results: print(f"No valid results after normalize/rasterize for {cat_name}"); continue
-
-                normalized_vector_sequences, raster_images_for_cat = zip(*valid_results)
-                combined = list(zip(normalized_vector_sequences, raster_images_for_cat))
-                random.shuffle(combined)
-                shuffled_vectors, shuffled_rasters = zip(*combined) if combined else ([], [])
-                n_total = len(shuffled_vectors)
-                n_train = int(train_r * n_total); n_val = int(val_r * n_total)
-                splits_vector = {"train": list(shuffled_vectors[:n_train]), "val": list(shuffled_vectors[n_train : n_train + n_val]), "test": list(shuffled_vectors[n_train + n_val:])}
-                splits_raster = {"train": list(shuffled_rasters[:n_train]), "val": list(shuffled_rasters[n_train : n_train + n_val]), "test": list(shuffled_rasters[n_train + n_val:])}
-                for split_name in ["train", "val", "test"]:
-                    vector_split_data = splits_vector[split_name]; raster_split_data = splits_raster[split_name]
-                    if not vector_split_data: continue
-                    vector_out_path = os.path.join(vector_proc_base, split_name, f"{cat_name}.npy")
-                    np.save(vector_out_path, np.array(vector_split_data, dtype=object))
-                    raster_cat_split_dir = os.path.join(raster_proc_base, split_name, cat_name)
-                    for i, pil_img in enumerate(raster_split_data):
-                        if pil_img is not None: 
-                            img_filename = f"sketch_{i:05d}.png"
-                            pil_img.save(os.path.join(raster_cat_split_dir, img_filename))
-
-    config_data = {
-        "dataset_name": "quickdraw", "quickdraw_std_dev": std_dev, "category_map": category_map, 
-        "categories_processed": categories_to_actually_process, 
-        "train_ratio": train_r, "val_ratio": val_r,
-        "test_ratio": round(1.0 - train_r - val_r, 2), 
-        "max_items_per_category_processed": max_items_cat if max_items_cat else "all",
-        "vector_data_path_relative": "quickdraw_vector", 
-        "raster_data_path_relative": "quickdraw_raster", 
+    # --- Write config ---
+    cfg = {
+        "dataset_name": "quickdraw",
+        "quickdraw_std_dev": std_dev,
+        "category_map": category_map,
+        "categories_processed": categories,
+        "train_ratio": train_r,
+        "val_ratio": val_r,
+        "test_ratio": round(1-train_r-val_r, 2),
+        "max_items_per_category_processed": max_items or "all",
+        "vector_data_path_relative": "quickdraw_vector",
+        "raster_data_path_relative": "quickdraw_raster",
         "raster_image_size": RASTER_IMG_SIZE,
-        "data_format_note_vector": "Each .npy file in quickdraw_vector: list of sequences [N,5] (dx,dy,p0,p1,p2), dx,dy normalized.",
-        "data_format_note_raster": f"PNG images in quickdraw_raster, {RASTER_IMG_SIZE}x{RASTER_IMG_SIZE}, binary."
+        "data_format_note_vector": "Each .npy: list of [N×5] arrays (dx,dy,p_down,p_up,p_eos), normalized dx/dy.",
+        "data_format_note_raster": f"PNG images in quickdraw_raster, {RASTER_IMG_SIZE}×{RASTER_IMG_SIZE}, binary."
     }
-    config_file_path = os.path.join(vector_proc_base, CONFIG_FILENAME) 
-    with open(config_file_path, 'w') as f: json.dump(config_data, f, indent=4)
-    print(f"\nPreprocessing complete. Vector and Raster data saved. Config: {config_file_path}")
+    cfg_path = os.path.join(vector_dir, CONFIG_FILENAME)
+    with open(cfg_path, 'w') as f:
+        json.dump(cfg, f, indent=4)
+
+    print(f"\nPreprocessing complete! Data in:\n  Vectors: {vector_dir}\n  Rasters: {raster_dir}\nConfig: {cfg_path}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="QuickDraw Preprocessing (Vector & Raster).")
     parser.add_argument("--categories", nargs="+", default=None)
     parser.add_argument("--all_categories", action="store_true")
-    parser.add_argument("--skip_raw_download", action="store_true", 
-                        help="Skip attempting to download raw .ndjson files. Only processes locally existing files from the target categories.")
-    parser.add_argument("--raw_dir", default=RAW_DOWNLOAD_DIR_ROOT, 
-                        help=f"Dir for raw .ndjson files (default: {RAW_DOWNLOAD_DIR_ROOT})")
-    parser.add_argument("--processed_dir", default=PROCESSED_DATA_DIR_ROOT, 
-                        help=f"Base directory to save processed data (default: {PROCESSED_DATA_DIR_ROOT})")
+    parser.add_argument("--skip_raw_download", action="store_true",
+                        help="Only process existing .ndjson files; do not fetch new ones.")
+    parser.add_argument("--raw_dir", default=RAW_DOWNLOAD_DIR_ROOT)
+    parser.add_argument("--processed_dir", default=PROCESSED_DATA_DIR_ROOT)
     parser.add_argument("--train_ratio", type=float, default=TRAIN_RATIO)
-    parser.add_argument("--val_ratio", type=float, default=VAL_RATIO)
+    parser.add_argument("--val_ratio",   type=float, default=VAL_RATIO)
     parser.add_argument("--max_items_per_category", type=int, default=None)
-    parser.add_argument("--num_workers", type=int, default=None, 
-                        help="Number of worker processes for CPU-bound tasks. Default: conservative (half CPUs, max 8). Set to 0 or 1 for single process.")
 
     args = parser.parse_args()
-
     if args.train_ratio + args.val_ratio >= 1.0:
         raise ValueError("train_ratio + val_ratio must be < 1.0.")
 
     os.makedirs(args.raw_dir, exist_ok=True)
     os.makedirs(args.processed_dir, exist_ok=True)
-    print(f"Using Raw Directory: {os.path.abspath(args.raw_dir)}")
-    print(f"Using Processed Directory: {os.path.abspath(args.processed_dir)}")
 
-    categories_to_process_initial_list = [] 
     if args.all_categories:
-        print("Attempting to download the full list of categories...")
-        downloaded_categories = download_all_categories_list()
-        if downloaded_categories: categories_to_process_initial_list = downloaded_categories
-        else: print("Failed to download category list. Using smaller fallback list."); categories_to_process_initial_list = FALLBACK_CATEGORIES
-        print(f"Targeting {len(categories_to_process_initial_list)} QuickDraw categories.")
+        cats = download_all_categories_list() or FALLBACK_CATEGORIES
+        print(f"Targeting {len(cats)} categories.")
     elif args.categories:
-        categories_to_process_initial_list = sorted(list(set(args.categories))) 
-        print(f"Targeting specified categories: {categories_to_process_initial_list}")
+        cats = sorted(set(args.categories))
+        print(f"Targeting specified categories: {cats}")
     else:
-        categories_to_process_initial_list = sorted(DEFAULT_CATEGORIES) 
-        print(f"Targeting DEFAULT categories: {categories_to_process_initial_list}")
-    
+        cats = sorted(DEFAULT_CATEGORIES)
+        print(f"Targeting default categories: {cats}")
+
+    print(f"Raw dir:       {os.path.abspath(args.raw_dir)}")
+    print(f"Processed dir: {os.path.abspath(args.processed_dir)}\n")
+
     main(
-        categories_to_process_initial=categories_to_process_initial_list, 
-        raw_dir_param=args.raw_dir, 
-        processed_dir_base_param=args.processed_dir, 
+        categories_initial=cats,
+        raw_dir=args.raw_dir,
+        proc_dir=args.processed_dir,
         train_r=args.train_ratio,
         val_r=args.val_ratio,
-        max_items_cat=args.max_items_per_category,
-        skip_raw_download_flag=args.skip_raw_download,
-        num_workers_preprocess=args.num_workers 
+        max_items=args.max_items_per_category,
+        skip_raw_download=args.skip_raw_download
     )
