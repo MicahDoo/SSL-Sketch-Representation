@@ -7,7 +7,8 @@ import numpy as np
 import requests
 from tqdm import tqdm
 from PIL import Image, ImageDraw 
-import multiprocessing
+import multiprocessing # Added for parallel processing
+import traceback # For detailed error logging in workers
 
 # --- Configuration ---
 BASE_DOWNLOAD_URL = "https://storage.googleapis.com/quickdraw_dataset/full/simplified/"
@@ -28,7 +29,7 @@ CONFIG_FILENAME = "quickdraw_config.json"
 
 # --- Helper Functions --- 
 def download_all_categories_list(url=CATEGORIES_LIST_URL):
-    print(f"Attempting to download category list from {url}...") # Line 31
+    print(f"Attempting to download category list from {url}...") 
     try:
         response = requests.get(url)
         response.raise_for_status()
@@ -88,7 +89,15 @@ def load_simplified_drawings(ndjson_path, max_items_per_category=None):
     return drawings
 
 def convert_raw_sketch_to_delta_sequence_mp_helper(raw_sketch_strokes):
-    return convert_raw_sketch_to_delta_sequence(raw_sketch_strokes)
+    """Helper for multiprocessing, calls the main conversion function and adds error handling."""
+    try:
+        return convert_raw_sketch_to_delta_sequence(raw_sketch_strokes)
+    except Exception as e:
+        # This print might not be visible directly if the worker crashes hard,
+        # but it's good practice for catching Python-level exceptions in workers.
+        print(f"Error in worker process during convert_raw_sketch_to_delta_sequence: {e}")
+        # print(traceback.format_exc()) # For more detailed traceback from worker
+        return np.array([], dtype=np.float32) # Return an empty array or specific error marker
 
 def convert_raw_sketch_to_delta_sequence(raw_sketch_strokes):
     points = []
@@ -159,12 +168,20 @@ def rasterize_sequence_to_pil_image(normalized_vector_sequence_np, image_size, l
     del draw
     return image.convert("1")
 
+# Helper function for Pass 2 parallel processing
 def normalize_and_rasterize_mp_helper(args_tuple):
     seq_array, std_dev_val, raster_img_size_val = args_tuple
-    norm_seq = seq_array.copy()
-    norm_seq[:, :2] /= std_dev_val
-    pil_img = rasterize_sequence_to_pil_image(norm_seq, raster_img_size_val)
-    return norm_seq, pil_img
+    try:
+        norm_seq = seq_array.copy()
+        norm_seq[:, :2] /= std_dev_val
+        pil_img = rasterize_sequence_to_pil_image(norm_seq, raster_img_size_val)
+        return norm_seq, pil_img
+    except Exception as e:
+        print(f"Error in worker process during normalize_and_rasterize: {e}")
+        # print(traceback.format_exc())
+        # Return a structure that won't break the zipping later, e.g., empty or None
+        return np.array([], dtype=np.float32), None 
+
 
 def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param, train_r, val_r, max_items_cat, skip_raw_download_flag, num_workers_preprocess):
     print(f"--- Starting QuickDraw Preprocessing for initially {len(categories_to_process_initial)} target categories ---")
@@ -174,19 +191,32 @@ def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param,
     
     pool_processes = None 
     actual_workers_to_be_used = 0
+
     if num_workers_preprocess is not None and num_workers_preprocess <= 0:
-        pool_processes = 1; actual_workers_to_be_used = 1
+        pool_processes = 1 
+        actual_workers_to_be_used = 1
         print(f"Using {actual_workers_to_be_used} worker process for CPU-bound tasks (num_workers_preprocess <= 0).")
     elif num_workers_preprocess is not None:
-        pool_processes = num_workers_preprocess; actual_workers_to_be_used = pool_processes
+        pool_processes = num_workers_preprocess
+        actual_workers_to_be_used = pool_processes
         print(f"Using {actual_workers_to_be_used} worker processes for CPU-bound tasks.")
     else: 
         try:
-            actual_workers_to_be_used = os.cpu_count()
-            print(f"Using default number of worker processes (os.cpu_count() = {actual_workers_to_be_used}) for CPU-bound tasks.")
+            cpu_count = os.cpu_count()
+            if cpu_count:
+                 # Default to a fraction of CPUs or a max cap to be more conservative
+                actual_workers_to_be_used = min(max(1, cpu_count // 2), 8) 
+                pool_processes = actual_workers_to_be_used # Explicitly set for Pool
+                print(f"Using {actual_workers_to_be_used} (half of available CPUs, capped at 8) worker processes for CPU-bound tasks.")
+            else:
+                print("os.cpu_count() returned None. Defaulting to 2 worker processes.")
+                pool_processes = 2
+                actual_workers_to_be_used = 2
         except NotImplementedError:
-            print("Warning: os.cpu_count() is not available. Defaulting to 1 worker process.")
-            pool_processes = 1; actual_workers_to_be_used = 1
+            print("Warning: os.cpu_count() is not available. Defaulting to 2 worker processes.")
+            pool_processes = 2 # A small default if cpu_count fails
+            actual_workers_to_be_used = 2
+
 
     vector_proc_base = os.path.join(processed_dir_base_param, "quickdraw_vector")
     raster_proc_base = os.path.join(processed_dir_base_param, "quickdraw_raster")
@@ -254,8 +284,11 @@ def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param,
     if pool_processes == 1: 
         print("  Executing Pass 1 conversions in a single process.")
         for cat_name, raw_drawings in tqdm(all_sketches_by_cat.items(), desc="Pass 1 Processing (Single Proc)"):
-            processed_sequences_for_cat = [seq for sketch_drawing in raw_drawings 
-                                           if (seq := convert_raw_sketch_to_delta_sequence(sketch_drawing)).size > 0]
+            processed_sequences_for_cat = []
+            for sketch_drawing in raw_drawings:
+                seq = convert_raw_sketch_to_delta_sequence_mp_helper(sketch_drawing)
+                if seq.size > 0:
+                    processed_sequences_for_cat.append(seq)
             if not processed_sequences_for_cat: print(f"No valid sequences for '{cat_name}'."); continue
             all_processed_sketches_by_cat[cat_name] = processed_sequences_for_cat
             random.shuffle(processed_sequences_for_cat)
@@ -287,9 +320,11 @@ def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param,
             norm_and_raster_results = []
             for seq_array in processed_sequences:
                 norm_seq, pil_img = normalize_and_rasterize_mp_helper((seq_array, std_dev, RASTER_IMG_SIZE))
-                norm_and_raster_results.append((norm_seq, pil_img))
+                if pil_img is not None: # Check if rasterization was successful
+                    norm_and_raster_results.append((norm_seq, pil_img))
             
-            normalized_vector_sequences, raster_images_for_cat = zip(*norm_and_raster_results) if norm_and_raster_results else ([], [])
+            if not norm_and_raster_results: continue # Skip if no results for this category
+            normalized_vector_sequences, raster_images_for_cat = zip(*norm_and_raster_results)
             combined = list(zip(normalized_vector_sequences, raster_images_for_cat))
             random.shuffle(combined)
             shuffled_vectors, shuffled_rasters = zip(*combined) if combined else ([], [])
@@ -304,15 +339,21 @@ def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param,
                 np.save(vector_out_path, np.array(vector_split_data, dtype=object))
                 raster_cat_split_dir = os.path.join(raster_proc_base, split_name, cat_name)
                 for i, pil_img in enumerate(raster_split_data):
-                    img_filename = f"sketch_{i:05d}.png"
-                    pil_img.save(os.path.join(raster_cat_split_dir, img_filename))
+                    if pil_img is not None: # Ensure image is valid before saving
+                        img_filename = f"sketch_{i:05d}.png"
+                        pil_img.save(os.path.join(raster_cat_split_dir, img_filename))
     else: 
         print(f"  Executing Pass 2 (Normalize & Rasterize) with a pool of {actual_workers_to_be_used} processes.")
         with multiprocessing.Pool(processes=pool_processes) as pool: 
             for cat_name, processed_sequences in tqdm(all_processed_sketches_by_cat.items(), desc="Pass 2 (Multi Proc)"):
                 tasks = [(seq, std_dev, RASTER_IMG_SIZE) for seq in processed_sequences]
-                norm_and_raster_results = pool.map(normalize_and_rasterize_mp_helper, tasks)
-                normalized_vector_sequences, raster_images_for_cat = zip(*norm_and_raster_results) if norm_and_raster_results else ([], [])
+                norm_and_raster_results_mp = pool.map(normalize_and_rasterize_mp_helper, tasks)
+                
+                # Filter out None results from workers if errors occurred
+                valid_results = [res for res in norm_and_raster_results_mp if res[1] is not None]
+                if not valid_results: continue
+
+                normalized_vector_sequences, raster_images_for_cat = zip(*valid_results)
                 combined = list(zip(normalized_vector_sequences, raster_images_for_cat))
                 random.shuffle(combined)
                 shuffled_vectors, shuffled_rasters = zip(*combined) if combined else ([], [])
@@ -327,8 +368,9 @@ def main(categories_to_process_initial, raw_dir_param, processed_dir_base_param,
                     np.save(vector_out_path, np.array(vector_split_data, dtype=object))
                     raster_cat_split_dir = os.path.join(raster_proc_base, split_name, cat_name)
                     for i, pil_img in enumerate(raster_split_data):
-                        img_filename = f"sketch_{i:05d}.png"
-                        pil_img.save(os.path.join(raster_cat_split_dir, img_filename))
+                        if pil_img is not None: # Ensure image is valid
+                            img_filename = f"sketch_{i:05d}.png"
+                            pil_img.save(os.path.join(raster_cat_split_dir, img_filename))
 
     config_data = {
         "dataset_name": "quickdraw", "quickdraw_std_dev": std_dev, "category_map": category_map, 
@@ -360,7 +402,7 @@ if __name__ == "__main__":
     parser.add_argument("--val_ratio", type=float, default=VAL_RATIO)
     parser.add_argument("--max_items_per_category", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None, 
-                        help="Number of worker processes for CPU-bound tasks. Default: all available CPUs. Set to 0 or 1 for single process.")
+                        help="Number of worker processes for CPU-bound tasks. Default: conservative (half CPUs, max 8). Set to 0 or 1 for single process.")
 
     args = parser.parse_args()
 
