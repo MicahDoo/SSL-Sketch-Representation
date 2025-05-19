@@ -25,11 +25,14 @@ import json
 import time
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import shutil # For copying best checkpoint
 
 # For Automatic Mixed Precision (AMP)
-# from torch.cuda.amp import autocast, GradScaler # Old import for autocast
-from torch.cuda.amp import GradScaler # GradScaler is still here
-# torch.amp.autocast will be used directly via torch.amp
+from torch.amp import autocast 
+from torch.cuda.amp import GradScaler 
+
+# For Profiler
+import torch.profiler
 
 try:
     from src.models.raster_encoder import ResNet50SketchEncoderBase
@@ -46,6 +49,7 @@ DEFAULT_SKETCH_IMG_SIZE = 224
 DEFAULT_DATASET_ROOT = os.path.join(PROJECT_ROOT, "processed_data") 
 DEFAULT_DATASET_NAME = "quickdraw"
 DEFAULT_CONFIG_FILENAME = "quickdraw_config.json"
+DEFAULT_CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
 
 class SketchClassifier(nn.Module):
     def __init__(self, num_classes, input_channels=1, use_pretrained_backbone=False, freeze_backbone=False):
@@ -68,66 +72,159 @@ class SketchClassifier(nn.Module):
         logits = self.classifier_head(features)
         return logits
 
+def save_checkpoint(epoch, model, optimizer, scheduler, history, best_val_acc, checkpoint_path, is_best=False):
+    checkpoint = {
+        'epoch': epoch + 1, 
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'best_val_acc': best_val_acc,
+        'history': history
+    }
+    if scheduler:
+        checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Checkpoint saved to {checkpoint_path}")
+    if is_best:
+        best_path = os.path.join(os.path.dirname(checkpoint_path), f"{os.path.basename(checkpoint_path).replace('_latest_checkpoint','_best_model')}")
+        shutil.copyfile(checkpoint_path, best_path)
+        print(f"Best model checkpoint saved to {best_path}")
+
+def load_checkpoint(model, optimizer, scheduler, checkpoint_path, device):
+    if not os.path.exists(checkpoint_path):
+        print(f"Warning: Checkpoint file not found at {checkpoint_path}. Starting from scratch.")
+        return 0, {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}, 0.0
+    print(f"Loading checkpoint from {checkpoint_path}...")
+    checkpoint = torch.load(checkpoint_path, map_location=device) 
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    start_epoch = checkpoint['epoch']
+    history = checkpoint.get('history', {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}) 
+    best_val_acc = checkpoint.get('best_val_acc', 0.0)
+    if scheduler and 'scheduler_state_dict' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        print("Scheduler state loaded.")
+    print(f"Resuming training from epoch {start_epoch}. Best val_acc so far: {best_val_acc:.4f}")
+    return start_epoch, history, best_val_acc
+
+
 def train_and_validate(model, train_dataloader, val_dataloader, loss_fn, optimizer, scheduler, 
-                       num_epochs, device, experiment_name="Classifier", use_amp=False): # Added use_amp flag
-    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
-    best_val_acc = 0.0
+                       num_epochs, device, experiment_name="Classifier", use_amp=False,
+                       checkpoint_dir="checkpoints", save_every=1, start_epoch=0, 
+                       initial_history=None, initial_best_val_acc=0.0,
+                       profile_steps=False): # New argument for profiling
+    
+    history = initial_history if initial_history is not None else {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+    best_val_acc = initial_best_val_acc
+    
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    latest_checkpoint_path = os.path.join(checkpoint_dir, f"{experiment_name}_latest_checkpoint.pth")
     
     scaler = None
-    amp_enabled_on_cuda = use_amp and device.type == 'cuda'
+    amp_on_cuda = use_amp and device.type == 'cuda'
 
-    if amp_enabled_on_cuda:
-        scaler = GradScaler()
-        print(f"DEBUG: Automatic Mixed Precision (AMP) enabled with GradScaler for {experiment_name} on CUDA.")
+    if amp_on_cuda:
+        try:
+            scaler = torch.amp.GradScaler(device_type='cuda', enabled=amp_on_cuda) 
+            print(f"DEBUG: Using torch.amp.GradScaler for {experiment_name} on CUDA.")
+        except AttributeError: 
+            scaler = GradScaler(enabled=amp_on_cuda)
+            print(f"DEBUG: Using torch.cuda.amp.GradScaler for {experiment_name} on CUDA.")
     elif use_amp and device.type == 'cpu':
-        # autocast on CPU uses bfloat16 if available, no GradScaler needed for bfloat16
         print(f"DEBUG: AMP with torch.amp.autocast('{device.type}') will be used for {experiment_name} on CPU (typically bfloat16 if supported).")
     
-    print(f"\n--- Starting Training: {experiment_name} for {num_epochs} epochs on {device} ---")
+    print(f"\n--- Starting Training: {experiment_name} from epoch {start_epoch} for {num_epochs} total epochs on {device} ---")
 
-    for epoch in range(num_epochs):
+    # Profiler setup
+    PROF_WARMUP = 1
+    PROF_ACTIVE = 3 # Number of steps to actively profile
+    PROF_REPEAT = 1 # Number of times to repeat the warmup+active cycle
+    
+    # Context manager for profiler
+    prof = None
+    if profile_steps and start_epoch == 0 : # Profile only at the beginning of a fresh run
+        print(f"DEBUG: Profiler enabled. Warmup: {PROF_WARMUP}, Active: {PROF_ACTIVE}, Repeat: {PROF_REPEAT} steps.")
+        activities_to_profile = [torch.profiler.ProfilerActivity.CPU]
+        if device.type == 'cuda':
+            activities_to_profile.append(torch.profiler.ProfilerActivity.CUDA)
+        
+        prof = torch.profiler.profile(
+            activities=activities_to_profile,
+            schedule=torch.profiler.schedule(wait=0, warmup=PROF_WARMUP, active=PROF_ACTIVE, repeat=PROF_REPEAT), # Schedule for first epoch, few batches
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join(checkpoint_dir, f'{experiment_name}_profile_trace')),
+            record_shapes=True,
+            profile_memory=True, # Enable memory profiling (can add overhead)
+            with_stack=True # To see call stacks
+        )
+        # prof.start() # Start is handled by the schedule for the first few batches
+
+    for epoch in range(start_epoch, num_epochs): 
+        current_epoch_display = epoch + 1 
         start_time_epoch = time.time()
         
         model.train()
-        running_train_loss = 0.0
-        correct_train_preds = 0
-        total_train_samples = 0
-
-        for batch_idx, data_batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]", leave=False)):
+        running_train_loss = 0.0; correct_train_preds = 0; total_train_samples = 0
+        
+        # Wrap the batch loop with profiler context if active for this epoch/batch
+        # The profiler with a schedule will automatically start/stop based on batch_idx
+        
+        batch_iterator = tqdm(train_dataloader, desc=f"Epoch {current_epoch_display}/{num_epochs} [Train]", leave=False)
+        
+        # Determine if we are in the profiling phase for this epoch
+        # We'll profile the first PROF_WARMUP + PROF_ACTIVE * PROF_REPEAT batches of the first epoch
+        is_profiling_epoch = (epoch == start_epoch and profile_steps)
+        
+        for batch_idx, data_batch in enumerate(batch_iterator):
             inputs = data_batch['raster_image'].to(device)
             targets = data_batch['label'].to(device)
             
             optimizer.zero_grad()
             
-            # Use torch.amp.autocast
-            # For CPU, it will use bfloat16 if available and enabled.
-            # For CUDA, it will use float16 if enabled.
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                outputs = model(inputs)
-                loss = loss_fn(outputs, targets)
+                outputs = model(inputs); loss = loss_fn(outputs, targets)
             
-            if scaler: # If AMP and CUDA are active (scaler is only for CUDA with float16)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else: # Standard backward and step (also for CPU AMP with bfloat16)
-                loss.backward()
-                optimizer.step()
+            if scaler: scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
+            else: loss.backward(); optimizer.step()
             
             running_train_loss += loss.item() * inputs.size(0)
             _, preds = torch.max(outputs, 1)
             correct_train_preds += torch.sum(preds == targets.data).item()
             total_train_samples += targets.size(0)
-            
+
+            if prof and is_profiling_epoch: # If profiler is active and in profiling phase
+                prof.step() # Signal profiler that a step is complete
+                if batch_idx >= (PROF_WARMUP + PROF_ACTIVE * PROF_REPEAT) -1 : # Check if profiling duration is over
+                    print("DEBUG: Profiling complete for initial batches.")
+                    # prof.stop() # Stop is handled by schedule if repeat=0, or automatically at end of context
+                    # For scheduled profiling, we don't manually stop unless we want to end early.
+                    # The on_trace_ready will handle export.
+                    # To print table immediately:
+                    # print(prof.key_averages().table(sort_by="self_cuda_time_total" if device.type == 'cuda' else "self_cpu_time_total", row_limit=15))
+                    # profile_steps = False # Disable further profiling in this run
+                    # prof = None # Deactivate profiler object
+                    pass # Let the schedule handle repeats and stopping.
+
+        # End of epoch
+        if prof and epoch == start_epoch and profile_steps: # If profiling was active for the first epoch
+            # If profiler was started with a schedule that repeats, it might still be running.
+            # To ensure it's stopped and trace is written if not done by on_trace_ready immediately:
+            # This might be redundant if on_trace_ready handles it.
+            # For a single profiling run at the start, this is okay.
+            # If profiler was created with a schedule that has repeat > 0, it will continue.
+            # For this setup, we typically want to profile only a few initial steps.
+            # The schedule with repeat=1 should handle one cycle.
+            pass
+
+
         epoch_train_loss = running_train_loss / total_train_samples if total_train_samples > 0 else 0
         epoch_train_acc = correct_train_preds / total_train_samples if total_train_samples > 0 else 0
         history['train_loss'].append(epoch_train_loss); history['train_acc'].append(epoch_train_acc)
 
+        # ... (Validation loop remains the same) ...
         model.eval()
         running_val_loss = 0.0; correct_val_preds = 0; total_val_samples = 0
         with torch.no_grad():
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                for batch_idx, data_batch in enumerate(tqdm(val_dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]", leave=False)):
+                for batch_idx, data_batch in enumerate(tqdm(val_dataloader, desc=f"Epoch {current_epoch_display}/{num_epochs} [Val]", leave=False)):
                     inputs = data_batch['raster_image'].to(device)
                     targets = data_batch['label'].to(device)
                     outputs = model(inputs); loss = loss_fn(outputs, targets)
@@ -135,7 +232,6 @@ def train_and_validate(model, train_dataloader, val_dataloader, loss_fn, optimiz
                     _, preds = torch.max(outputs, 1)
                     correct_val_preds += torch.sum(preds == targets.data).item()
                     total_val_samples += targets.size(0)
-
         epoch_val_loss = running_val_loss / total_val_samples if total_val_samples > 0 else 0
         epoch_val_acc = correct_val_preds / total_val_samples if total_val_samples > 0 else 0
         history['val_loss'].append(epoch_val_loss); history['val_acc'].append(epoch_val_acc)
@@ -145,15 +241,34 @@ def train_and_validate(model, train_dataloader, val_dataloader, loss_fn, optimiz
             else: scheduler.step()
         
         epoch_duration = time.time() - start_time_epoch
-        print(f"Epoch {epoch+1}/{num_epochs} [{experiment_name}] - Dur: {epoch_duration:.1f}s")
+        print(f"Epoch {current_epoch_display}/{num_epochs} [{experiment_name}] - Dur: {epoch_duration:.1f}s")
         print(f"  TrL: {epoch_train_loss:.4f}, TrA: {epoch_train_acc:.4f} | VaL: {epoch_val_loss:.4f}, VaA: {epoch_val_acc:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
-        if epoch_val_acc > best_val_acc:
-            best_val_acc = epoch_val_acc
+        is_best = epoch_val_acc > best_val_acc
+        if is_best: best_val_acc = epoch_val_acc
+        if (epoch + 1) % save_every == 0 or is_best or (epoch + 1) == num_epochs : 
+            save_checkpoint(epoch, model, optimizer, scheduler, history, best_val_acc, latest_checkpoint_path, is_best=is_best)
+            
+    # After the training loop, if profiler was used and needs explicit stop/export
+    if prof and profile_steps: # Check if profiler was initialized
+        print("DEBUG: Training loop finished. Finalizing profiler if active...")
+        # If using context manager style, it stops automatically.
+        # If using prof.start()/stop() manually, ensure stop is called.
+        # For scheduled profiling, the trace should be written by on_trace_ready.
+        # We can print the table here if desired.
+        print("--- Profiler Results (Top 15 by self CUDA time or CPU time if CUDA unavailable) ---")
+        sort_by_key = "self_cuda_time_total" if device.type == 'cuda' else "self_cpu_time_total"
+        print(prof.key_averages().table(sort_by=sort_by_key, row_limit=15))
+        print(f"Profiler trace saved to directory: {os.path.join(checkpoint_dir, f'{experiment_name}_profile_trace')}")
+
+
     print(f"Training for {experiment_name} complete! Best Val Acc: {best_val_acc:.4f}")
     return history
 
+# ... (plot_training_history, save_checkpoint, load_checkpoint, main, argparse as before) ...
+# Ensure main passes args.profile to train_and_validate
+
 def plot_training_history(history, experiment_name="Experiment", save_path=None):
-    if not history: print(f"No training history to plot for {experiment_name}."); return
+    if not history or not history.get('train_acc'): print(f"No training history to plot for {experiment_name}."); return 
     plt.style.use('seaborn-v0_8-whitegrid')
     fig, axs = plt.subplots(1, 2, figsize=(15, 5))
     fig.suptitle(f"Training History: {experiment_name}", fontsize=16)
@@ -169,141 +284,105 @@ def plot_training_history(history, experiment_name="Experiment", save_path=None)
 
 def main(args):
     if SketchDataset is None or ResNet50SketchEncoderBase is None:
-        print("Required modules (SketchDataset or ResNet50SketchEncoderBase) not imported. Exiting.")
+        print("Required modules not imported. Exiting.")
         return
 
-    device = torch.device("cuda" if torch.cuda.is_available() and args.use_gpu else "cpu")
+    if args.use_gpu and torch.cuda.is_available():
+        if args.gpu_id is not None:
+            if args.gpu_id < torch.cuda.device_count(): device_str = f"cuda:{args.gpu_id}"
+            else: print(f"Warning: GPU ID {args.gpu_id} invalid. Using default cuda:0."); device_str = "cuda:0"
+        else: device_str = "cuda"
+        device = torch.device(device_str)
+    else:
+        if args.use_gpu and not torch.cuda.is_available(): print("Warning: --use_gpu specified, but CUDA not available. Using CPU.")
+        device = torch.device("cpu")
     print(f"Using device: {device}")
 
-    use_amp_for_training = args.use_amp # AMP can be enabled for CPU (bfloat16) or CUDA (float16)
-    if args.use_amp and device.type == 'cuda':
-        print("AMP will be enabled for CUDA training (using float16 and GradScaler).")
-    elif args.use_amp and device.type == 'cpu':
-        print("AMP will be enabled for CPU training (using bfloat16 if supported, no GradScaler).")
-    elif args.use_amp: # use_amp is true but not cuda and not cpu (should not happen)
-        print("Warning: --use_amp specified, but device type is not 'cuda' or 'cpu'. AMP behavior undefined.")
-
-
-    if not os.path.isabs(args.dataset_root):
-        dataset_root_abs = os.path.join(PROJECT_ROOT, args.dataset_root)
-        print(f"DEBUG: Relative dataset_root '{args.dataset_root}' resolved to absolute path: '{dataset_root_abs}'")
-    else:
-        dataset_root_abs = args.dataset_root
-        print(f"DEBUG: Using absolute dataset_root: '{dataset_root_abs}'")
-
+    if not os.path.isabs(args.dataset_root): dataset_root_abs = os.path.join(PROJECT_ROOT, args.dataset_root)
+    else: dataset_root_abs = args.dataset_root
+    print(f"DEBUG: Using absolute dataset_root: '{dataset_root_abs}'")
     vector_data_root = os.path.join(dataset_root_abs, f"{args.dataset_name}_vector")
     main_config_path = os.path.join(vector_data_root, args.config_filename)
-    
     num_classes = None
     if os.path.exists(main_config_path):
-        with open(main_config_path, 'r') as f:
-            config = json.load(f)
-            num_classes = len(config.get("category_map", {}))
-            print(f"Loaded config from {main_config_path}. Number of classes: {num_classes}")
+        with open(main_config_path, 'r') as f: config = json.load(f)
+        num_classes = len(config.get("category_map", {}))
+        print(f"Loaded config from {main_config_path}. Number of classes: {num_classes}")
     else:
-        print(f"Warning: Main config file not found at {main_config_path}. Cannot determine num_classes automatically.")
-        if args.num_classes:
-            num_classes = args.num_classes
-            print(f"Using num_classes from arguments: {num_classes}")
-        else:
-            print("Error: num_classes not determined. Please provide --num_classes or ensure config file exists.")
-            return
-            
-    if not num_classes or num_classes == 0: 
-        print("Error: Number of classes is 0 or not determined. Check config or --num_classes argument.")
-        return
+        if args.num_classes: num_classes = args.num_classes; print(f"Using num_classes from arguments: {num_classes}")
+        else: print("Error: num_classes not determined."); return
+    if not num_classes or num_classes == 0: print("Error: Number of classes is 0 or not determined."); return
 
-    input_channels_for_model = 1 
-    raster_image_transform = transforms.ToTensor() 
-    
+    input_channels_for_model = 1; raster_image_transform = transforms.ToTensor()
     if args.use_pretrained:
         input_channels_for_model = 3 
         print("Using pretrained backbone. Data will be transformed to 3-channels and normalized.")
         raster_image_transform = transforms.Compose([
             transforms.ToTensor(),  
             transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.ndim == 3 and x.shape[0]==1 else x), 
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-    else:
-        print("Training backbone from scratch. Expecting 1-channel input to model. Applying ToTensor.")
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+    else: print("Training backbone from scratch. Expecting 1-channel input. Applying ToTensor.")
     
-    print(f"Initializing SketchDataset for training (split: {args.train_split})...")
-    train_dataset = SketchDataset(
-        dataset_path=dataset_root_abs, 
-        dataset_name=args.dataset_name,
-        split=args.train_split,
-        image_size=args.img_size,
-        max_seq_len=args.max_seq_len, 
-        config_filename=args.config_filename,
-        raster_transform=raster_image_transform 
-    )
-    print(f"Initializing SketchDataset for validation (split: {args.val_split})...")
-    val_dataset = SketchDataset(
-        dataset_path=dataset_root_abs, 
-        dataset_name=args.dataset_name,
-        split=args.val_split,
-        image_size=args.img_size,
-        max_seq_len=args.max_seq_len,
-        config_filename=args.config_filename,
-        raster_transform=raster_image_transform 
-    )
-
-    if len(train_dataset) == 0 or len(val_dataset) == 0:
-        print("Training or validation dataset is empty. Please check data paths and preprocessing.")
-        return
-
+    train_dataset = SketchDataset(dataset_path=dataset_root_abs, dataset_name=args.dataset_name, split=args.train_split, image_size=args.img_size, max_seq_len=args.max_seq_len, config_filename=args.config_filename, raster_transform=raster_image_transform)
+    val_dataset = SketchDataset(dataset_path=dataset_root_abs, dataset_name=args.dataset_name, split=args.val_split, image_size=args.img_size, max_seq_len=args.max_seq_len, config_filename=args.config_filename, raster_transform=raster_image_transform)
+    if len(train_dataset) == 0 or len(val_dataset) == 0: print("Training or validation dataset is empty."); return
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
     val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
     print(f"DataLoaders created. Train batches: {len(train_dataloader)}, Val batches: {len(val_dataloader)}")
 
-    model = SketchClassifier(
-        num_classes=num_classes,
-        input_channels=input_channels_for_model, 
-        use_pretrained_backbone=args.use_pretrained,
-        freeze_backbone=args.freeze_backbone
-    ).to(device)
-
+    model = SketchClassifier(num_classes=num_classes, input_channels=input_channels_for_model, use_pretrained_backbone=args.use_pretrained, freeze_backbone=args.freeze_backbone).to(device)
     criterion = nn.CrossEntropyLoss()
     lr = args.lr if not args.use_pretrained else args.lr * 0.1 
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=args.lr_patience, factor=0.1) 
 
-    experiment_name = f"ResNetClassifier_Prtnd_{args.use_pretrained}_AMP_{use_amp_for_training}" # Shorter name
+    start_epoch = 0; initial_history = None; initial_best_val_acc = 0.0
+    experiment_name = f"ResNetClassify_Prtnd_{args.use_pretrained}_AMP_{args.use_amp and device.type=='cuda'}"
+    checkpoint_dir_abs = os.path.join(PROJECT_ROOT, args.checkpoint_dir) if not os.path.isabs(args.checkpoint_dir) else args.checkpoint_dir
+    latest_checkpoint_file = os.path.join(checkpoint_dir_abs, f"{experiment_name}_latest_checkpoint.pth")
+
+    if args.resume:
+        if os.path.exists(latest_checkpoint_file):
+            start_epoch, initial_history, initial_best_val_acc = load_checkpoint(model, optimizer, scheduler, latest_checkpoint_file, device)
+        else: print(f"Resume requested, but no checkpoint found at {latest_checkpoint_file}. Starting fresh.")
+    else: print("Starting training from scratch (no resume).")
+    
     history = train_and_validate(model, train_dataloader, val_dataloader, criterion, optimizer, scheduler,
                                  num_epochs=args.epochs, device=device, experiment_name=experiment_name,
-                                 use_amp=args.use_amp) # Pass args.use_amp directly
-    
+                                 use_amp=args.use_amp, checkpoint_dir=checkpoint_dir_abs, 
+                                 save_every=args.save_every, start_epoch=start_epoch,
+                                 initial_history=initial_history, initial_best_val_acc=initial_best_val_acc,
+                                 profile_steps=args.profile) # Pass profile flag
     if history:
-        plot_save_path = f"{experiment_name}_training_history.png" 
+        plot_save_path = os.path.join(checkpoint_dir_abs, f"{experiment_name}_final_training_history.png") 
         plot_training_history(history, experiment_name, save_path=plot_save_path)
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Train a ResNet Sketch Classifier on QuickDraw (or similar).")
-    parser.add_argument('--dataset_root', type=str, default=DEFAULT_DATASET_ROOT, 
-                        help=f"Root directory of the processed dataset (default: relative to project root as '{os.path.basename(DEFAULT_DATASET_ROOT)}').")
-    parser.add_argument('--dataset_name', type=str, default=DEFAULT_DATASET_NAME, help='Name of the dataset (e.g., quickdraw).')
-    parser.add_argument('--config_filename', type=str, default=DEFAULT_CONFIG_FILENAME, help='Name of the config file in the dataset_name_vector directory.')
-    parser.add_argument('--train_split', type=str, default='train', help='Name of the training split.')
-    parser.add_argument('--val_split', type=str, default='val', help='Name of the validation split.')
-    parser.add_argument('--img_size', type=int, default=DEFAULT_SKETCH_IMG_SIZE, help='Image size for raster sketches.')
-    parser.add_argument('--max_seq_len', type=int, default=70, help='Max sequence length for vector part (passed to SketchDataset).')
-    parser.add_argument('--num_classes', type=int, default=None, help='Number of classes (if not determinable from config).')
-    parser.add_argument('--use_pretrained', action='store_true', help='Use ImageNet pre-trained weights for ResNet backbone.')
-    parser.add_argument('--freeze_backbone', action='store_true', help='Freeze weights of the ResNet backbone (only classifier head trains).')
-    parser.add_argument('--epochs', type=int, default=20, help='Number of training epochs.')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training and validation.')
-    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate.')
-    parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay for optimizer.')
-    parser.add_argument('--lr_patience', type=int, default=3, help='Patience for ReduceLROnPlateau scheduler.')
-    parser.add_argument('--num_workers', type=int, default=2, help='Number of workers for DataLoader.')
-    parser.add_argument('--use_gpu', action='store_true', help='Use GPU if available.')
+    parser = argparse.ArgumentParser(description="Train a ResNet Sketch Classifier.")
+    parser.add_argument('--dataset_root', type=str, default=DEFAULT_DATASET_ROOT)
+    parser.add_argument('--dataset_name', type=str, default=DEFAULT_DATASET_NAME)
+    parser.add_argument('--config_filename', type=str, default=DEFAULT_CONFIG_FILENAME)
+    parser.add_argument('--train_split', type=str, default='train')
+    parser.add_argument('--val_split', type=str, default='val')
+    parser.add_argument('--img_size', type=int, default=DEFAULT_SKETCH_IMG_SIZE)
+    parser.add_argument('--max_seq_len', type=int, default=70)
+    parser.add_argument('--num_classes', type=int, default=None)
+    parser.add_argument('--use_pretrained', action='store_true')
+    parser.add_argument('--freeze_backbone', action='store_true')
+    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--batch_size', type=int, default=32, help="Batch size. Increase if VRAM allows.")
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--lr_patience', type=int, default=3)
+    parser.add_argument('--num_workers', type=int, default=2, help="Number of DataLoader workers. Increase if data loading is a bottleneck and CPU allows.")
+    parser.add_argument('--use_gpu', action='store_true')
+    parser.add_argument('--gpu_id', type=int, default=None)
     parser.add_argument('--use_amp', action='store_true', help='Use Automatic Mixed Precision (AMP).') 
+    parser.add_argument('--checkpoint_dir', type=str, default=DEFAULT_CHECKPOINT_DIR)
+    parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--save_every', type=int, default=1)
+    parser.add_argument('--profile', action='store_true', help='Enable PyTorch profiler for a few initial steps of the first epoch.') # New argument
 
     args = parser.parse_args()
-    
-    print("\n--- Parsed Arguments ---")
-    for arg, value in vars(args).items():
-        print(f"{arg}: {value}")
-    print("------------------------\n")
-
+    print("\n--- Parsed Arguments ---"); print(vars(args)); print("------------------------\n")
     main(args)
