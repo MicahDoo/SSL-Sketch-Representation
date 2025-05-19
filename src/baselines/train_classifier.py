@@ -2,21 +2,21 @@
 """
 train_classifier_optimized.py
 ---------------------------------
-A fully-refactored version of the original `train_classifier.py`, with
+A fully‑refactored version of the original `train_classifier.py`, with
 
 * cuDNN autotune (`torch.backends.cudnn.benchmark`)
-* channels-last memory format on model **and** inputs
+* channels‑last memory format on model **and** inputs
 * Automatic Mixed Precision (FP16) via `torch.autocast`
-* optional `torch.compile` for kernel fusion on PyTorch 2.x
-* beefed-up DataLoader (16 workers, prefetch, pinned memory, persistent workers)
-* single-pass profiling (no double compute)
-* non-blocking host→device transfers
+* optional `torch.compile` for kernel fusion on PyTorch 2.x
+* beefed‑up DataLoader (16 workers, prefetch, pinned memory, persistent workers)
+* single‑pass profiling (no double compute)
+* non‑blocking host→device transfers
 
 The CLI is unchanged, so all existing shell scripts keep working.
 """
 
 # -----------------------------------------------------------------------------
-# 🔧 Global performance switches — must be set **before** the first model import
+# 🔧 Global performance switches — must be set **before** the first model import
 # -----------------------------------------------------------------------------
 import os, sys, time, json, argparse, shutil
 import torch
@@ -25,7 +25,7 @@ torch.backends.cudnn.benchmark = True                       # fastest conv kerne
 torch.set_float32_matmul_precision('high')                  # better GEMMs on ≥2.1
 
 # -----------------------------------------------------------------------------
-# 📂 Path setup
+# 📂 Path setup
 # -----------------------------------------------------------------------------
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
@@ -34,7 +34,7 @@ if PROJECT_ROOT not in sys.path:
 print(f"DEBUG: Added {PROJECT_ROOT} to sys.path")
 
 # -----------------------------------------------------------------------------
-# 🧩 Imports that rely on `PROJECT_ROOT` being on sys.path
+# 🧩 Imports that rely on `PROJECT_ROOT` being on sys.path
 # -----------------------------------------------------------------------------
 from torch import nn, optim, autocast
 from torch.cuda.amp import GradScaler
@@ -49,7 +49,7 @@ except ImportError as e:
     sys.exit(f"Import error: {e}. Check your repo layout.")
 
 # -----------------------------------------------------------------------------
-# ⚙️ Configuration defaults
+# ⚙️ Configuration defaults
 # -----------------------------------------------------------------------------
 DEFAULT_SKETCH_IMG_SIZE = 224
 DEFAULT_DATASET_ROOT    = os.path.join(PROJECT_ROOT, "processed_data")
@@ -60,7 +60,7 @@ DEFAULT_NUM_WORKERS     = min(16, os.cpu_count() or 8)
 DEFAULT_PREFETCH        = 4
 
 # -----------------------------------------------------------------------------
-# 🏗️ Model definition
+# 🏗️ Model definition
 # -----------------------------------------------------------------------------
 class SketchClassifier(nn.Module):
     def __init__(self, num_classes: int, input_channels: int = 1,
@@ -79,7 +79,7 @@ class SketchClassifier(nn.Module):
         return self.classifier_head(self.backbone(x))
 
 # -----------------------------------------------------------------------------
-# 💾 Checkpoint helpers
+# 💾 Checkpoint helpers
 # -----------------------------------------------------------------------------
 
 def save_checkpoint(epoch, model, optimizer, scheduler, history, best_val_acc, path, is_best=False):
@@ -108,11 +108,11 @@ def load_checkpoint(model, optimizer, scheduler, path, device):
     optimizer.load_state_dict(ckpt["optim"])
     if scheduler and "scheduler" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler"])
-    print(f"Resumed from epoch {ckpt['epoch']} (best val_acc={ckpt['best_val_acc']:.4f})")
+    print(f"Resumed from epoch {ckpt['epoch']} (best val_acc={ckpt['best_val_acc']:.4f})")
     return ckpt["epoch"], ckpt["history"], ckpt["best_val_acc"]
 
 # -----------------------------------------------------------------------------
-# 🚂 Training / validation loop
+# 🚂 Training / validation loop
 # -----------------------------------------------------------------------------
 
 def train_and_validate(model, train_loader, val_loader, criterion, optimizer, scheduler,
@@ -126,7 +126,7 @@ def train_and_validate(model, train_loader, val_loader, criterion, optimizer, sc
     amp_enabled = use_amp and device.type == "cuda"
     scaler      = GradScaler(enabled=amp_enabled)
 
-    # Optional: profiler for first N steps
+    # Optional: profiler for first N steps
     prof = None
     if profile_steps and start_epoch == 0:
         activities = [torch.profiler.ProfilerActivity.CPU]
@@ -154,7 +154,7 @@ def train_and_validate(model, train_loader, val_loader, criterion, optimizer, sc
                 for b, batch in enumerate(train_loop):
                     _train_step(batch)
                     prof.step()
-                    if b >= 4:  # 1 warm-up + 3 active
+                    if b >= 4:  # 1 warm‑up + 3 active
                         break
             continue  # skip duplicate compute below
 
@@ -231,14 +231,14 @@ def train_and_validate(model, train_loader, val_loader, criterion, optimizer, sc
         return loss.item(), correct, targets.size(0)
 
 # -----------------------------------------------------------------------------
-# 🚀 Main
+# 🚀 Main
 # -----------------------------------------------------------------------------
 
 def main(args):
     device = torch.device(f"cuda:{args.gpu_id}" if args.use_gpu and torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Data transforms (repeat grayscale → 3 channels if using ImageNet weights)
+    # Data transforms (repeat grayscale → 3 channels if using ImageNet weights)
     tf = transforms.ToTensor()
     ch_in = 1
     if args.use_pretrained:
@@ -268,10 +268,21 @@ def main(args):
                               prefetch_factor=DEFAULT_PREFETCH, persistent_workers=True,
                               pin_memory=True)
 
-    # Num classes
-    num_classes = train_ds.num_classes if hasattr(train_ds, "num_classes") else args.num_classes
-    if not num_classes:
-        raise ValueError("Could not determine `num_classes`. Pass with --num_classes.")
+        # ------- Number of classes -------
+    if args.num_classes:
+        num_classes = args.num_classes
+    elif hasattr(train_ds, 'num_classes') and train_ds.num_classes:
+        num_classes = train_ds.num_classes
+        print(f"Number of classes determined from train_ds: {num_classes}")
+    else:
+        config_path = os.path.join(ds_root, f"{args.dataset_name}_vector", args.config_filename)
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                cfg = json.load(f)
+            num_classes = len(cfg.get('category_map', {}))
+            print(f"Loaded {num_classes} classes from {config_path}")
+        else:
+            raise ValueError("Could not infer num_classes. Pass --num_classes or supply a config with category_map.")
 
     # Model — channels_last + (optional) compile
     model = SketchClassifier(num_classes, input_channels=ch_in,
@@ -304,7 +315,7 @@ def main(args):
                        profile_steps=args.profile)
 
 # -----------------------------------------------------------------------------
-# 🛠️ CLI
+# 🛠️ CLI
 # -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
