@@ -26,6 +26,9 @@ import time
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
+# For Automatic Mixed Precision (AMP)
+from torch.cuda.amp import autocast, GradScaler
+
 try:
     from src.models.raster_encoder import ResNet50SketchEncoderBase
     from data.dataset import SketchDataset 
@@ -64,23 +67,53 @@ class SketchClassifier(nn.Module):
         return logits
 
 def train_and_validate(model, train_dataloader, val_dataloader, loss_fn, optimizer, scheduler, 
-                       num_epochs, device, experiment_name="Classifier"):
+                       num_epochs, device, experiment_name="Classifier", use_amp=False): # Added use_amp flag
     history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
     best_val_acc = 0.0
+    
+    # Initialize GradScaler if AMP is enabled and on CUDA
+    scaler = None
+    if use_amp and device.type == 'cuda':
+        scaler = GradScaler()
+        print(f"DEBUG: Automatic Mixed Precision (AMP) enabled with GradScaler for {experiment_name}.")
+    elif use_amp and device.type == 'cpu':
+        print(f"DEBUG: AMP with autocast will run on CPU for {experiment_name}, but GradScaler is not used.")
+    
     print(f"\n--- Starting Training: {experiment_name} for {num_epochs} epochs on {device} ---")
+
     for epoch in range(num_epochs):
         start_time_epoch = time.time()
+        
         model.train()
-        running_train_loss = 0.0; correct_train_preds = 0; total_train_samples = 0
+        running_train_loss = 0.0
+        correct_train_preds = 0
+        total_train_samples = 0
+
         for batch_idx, data_batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]", leave=False)):
             inputs = data_batch['raster_image'].to(device)
             targets = data_batch['label'].to(device)
-            optimizer.zero_grad(); outputs = model(inputs); loss = loss_fn(outputs, targets)
-            loss.backward(); optimizer.step()
+            
+            optimizer.zero_grad()
+            
+            # Use autocast for the forward pass and loss calculation if AMP is enabled
+            # autocast can run on CPU but will be a no-op if device is CPU (no float16)
+            with autocast(enabled=(use_amp and device.type == 'cuda')): # Only enable for CUDA for float16
+                outputs = model(inputs)
+                loss = loss_fn(outputs, targets)
+            
+            if scaler: # If AMP and CUDA are active
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else: # Standard backward and step
+                loss.backward()
+                optimizer.step()
+            
             running_train_loss += loss.item() * inputs.size(0)
             _, preds = torch.max(outputs, 1)
             correct_train_preds += torch.sum(preds == targets.data).item()
             total_train_samples += targets.size(0)
+            
         epoch_train_loss = running_train_loss / total_train_samples if total_train_samples > 0 else 0
         epoch_train_acc = correct_train_preds / total_train_samples if total_train_samples > 0 else 0
         history['train_loss'].append(epoch_train_loss); history['train_acc'].append(epoch_train_acc)
@@ -88,14 +121,19 @@ def train_and_validate(model, train_dataloader, val_dataloader, loss_fn, optimiz
         model.eval()
         running_val_loss = 0.0; correct_val_preds = 0; total_val_samples = 0
         with torch.no_grad():
-            for batch_idx, data_batch in enumerate(tqdm(val_dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]", leave=False)):
-                inputs = data_batch['raster_image'].to(device)
-                targets = data_batch['label'].to(device)
-                outputs = model(inputs); loss = loss_fn(outputs, targets)
-                running_val_loss += loss.item() * inputs.size(0)
-                _, preds = torch.max(outputs, 1)
-                correct_val_preds += torch.sum(preds == targets.data).item()
-                total_val_samples += targets.size(0)
+            # Autocast can also be used for inference, though often not strictly necessary
+            # if the model was trained with AMP, as it might expect certain dtypes.
+            # For simplicity, we'll use it here too if enabled.
+            with autocast(enabled=(use_amp and device.type == 'cuda')):
+                for batch_idx, data_batch in enumerate(tqdm(val_dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]", leave=False)):
+                    inputs = data_batch['raster_image'].to(device)
+                    targets = data_batch['label'].to(device)
+                    outputs = model(inputs); loss = loss_fn(outputs, targets)
+                    running_val_loss += loss.item() * inputs.size(0)
+                    _, preds = torch.max(outputs, 1)
+                    correct_val_preds += torch.sum(preds == targets.data).item()
+                    total_val_samples += targets.size(0)
+
         epoch_val_loss = running_val_loss / total_val_samples if total_val_samples > 0 else 0
         epoch_val_acc = correct_val_preds / total_val_samples if total_val_samples > 0 else 0
         history['val_loss'].append(epoch_val_loss); history['val_acc'].append(epoch_val_acc)
@@ -135,6 +173,14 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() and args.use_gpu else "cpu")
     print(f"Using device: {device}")
 
+    # Determine if AMP should be used based on args and CUDA availability
+    use_amp_for_training = args.use_amp and (device.type == 'cuda')
+    if args.use_amp and device.type == 'cpu':
+        print("Warning: --use_amp was specified, but no CUDA GPU is available. AMP will not use float16.")
+    elif use_amp_for_training:
+        print("AMP will be enabled for CUDA training.")
+
+
     if not os.path.isabs(args.dataset_root):
         dataset_root_abs = os.path.join(PROJECT_ROOT, args.dataset_root)
         print(f"DEBUG: Relative dataset_root '{args.dataset_root}' resolved to absolute path: '{dataset_root_abs}'")
@@ -165,30 +211,19 @@ def main(args):
         return
 
     input_channels_for_model = 1 
-    raster_image_transform = None 
+    raster_image_transform = transforms.ToTensor() # Default to ToTensor for scratch
     
     if args.use_pretrained:
         input_channels_for_model = 3 
         print("Using pretrained backbone. Data will be transformed to 3-channels and normalized.")
         raster_image_transform = transforms.Compose([
-            transforms.ToTensor(),  # Convert PIL Image to Tensor FIRST
-            transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.shape[0]==1 and x.ndim==3 else x), # Repeat grayscale if 1 channel tensor
+            transforms.ToTensor(),  
+            transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.ndim == 3 and x.shape[0]==1 else x), 
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
     else:
-        print("Training backbone from scratch. Expecting 1-channel input to model.")
-        # If SketchDataset outputs PIL, ToTensor is needed. If it outputs [0,1] tensor, this is fine.
-        # SketchDataset's default is ToTensor if no transform is passed.
-        # If you want to ensure it's a tensor for the scratch case too (if SketchDataset might not always do it):
-        # raster_image_transform = transforms.ToTensor() 
-        # Or if you want 1-channel normalization:
-        # raster_image_transform = transforms.Compose([
-        #     transforms.ToTensor(),
-        #     transforms.Normalize(mean=[0.5], std=[0.5])
-        # ])
-        pass # Assuming SketchDataset's default ToTensor is sufficient for 1-channel [0,1] tensor
-
-
+        print("Training backbone from scratch. Expecting 1-channel input to model. Applying ToTensor.")
+    
     print(f"Initializing SketchDataset for training (split: {args.train_split})...")
     train_dataset = SketchDataset(
         dataset_path=dataset_root_abs, 
@@ -230,9 +265,10 @@ def main(args):
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=args.lr_patience, factor=0.1) 
 
-    experiment_name = f"ResNetClassifier_Pretrained_{args.use_pretrained}"
+    experiment_name = f"ResNetClassifier_Pretrained_{args.use_pretrained}_AMP_{use_amp_for_training}"
     history = train_and_validate(model, train_dataloader, val_dataloader, criterion, optimizer, scheduler,
-                                 num_epochs=args.epochs, device=device, experiment_name=experiment_name)
+                                 num_epochs=args.epochs, device=device, experiment_name=experiment_name,
+                                 use_amp=use_amp_for_training) # Pass use_amp flag
     
     if history:
         plot_save_path = f"{experiment_name}_training_history.png" 
@@ -256,8 +292,10 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate.')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay for optimizer.')
     parser.add_argument('--lr_patience', type=int, default=3, help='Patience for ReduceLROnPlateau scheduler.')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of workers for DataLoader.')
+    parser.add_argument('--num_workers', type=int, default=2, help='Number of workers for DataLoader.')
     parser.add_argument('--use_gpu', action='store_true', help='Use GPU if available.')
+    parser.add_argument('--use_amp', action='store_true', help='Use Automatic Mixed Precision (AMP) if on CUDA GPU.') # New argument
+
     args = parser.parse_args()
     
     print("\n--- Parsed Arguments ---")

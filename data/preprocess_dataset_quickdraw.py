@@ -6,7 +6,7 @@ import random
 import argparse
 import threading
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-from multiprocessing import Pool, cpu_count # Ensure Pool is imported
+from multiprocessing import Pool, cpu_count 
 import numpy as np
 import requests
 from tqdm import tqdm
@@ -136,7 +136,7 @@ def load_sketches_from_npz(npz_path: str, max_items_per_category=None):
                     elif sketch_raw.ndim == 2 and sketch_raw.shape[1] == 5: 
                          all_sketches_5_element.append(sketch_raw.astype(np.float32))
                     if max_items_per_category is not None and len(all_sketches_5_element) >= max_items_per_category:
-                        return all_sketches_5_element
+                        return all_sketches_5_element # Return early
         return all_sketches_5_element
     except Exception as e:
         print(f"Error loading or processing NPZ file {npz_path}: {e}")
@@ -208,28 +208,30 @@ def _rasterize_save_task(args_tuple):
     except Exception as e:
         return False
 
-def run_pass1_for_category(cat_name, raw_sketches_5_element, vec_base, std_dev, train_r, val_r, n_workers_ignored): 
-    if not raw_sketches_5_element:
-        return
+def run_pass1_for_category(cat_name, raw_sketches_5_element, vec_base, std_dev, train_r, val_r, n_workers): 
+    if not raw_sketches_5_element: return
+    tasks = [(seq, std_dev) for seq in raw_sketches_5_element] 
     normalized_sequences = []
-    for seq_5_elem in raw_sketches_5_element: # Sequential processing
-        norm_seq = normalize_sequence_task((seq_5_elem, std_dev))
-        if norm_seq is not None:
-            normalized_sequences.append(norm_seq)
-    if not normalized_sequences:
-        return
+    pool_processes = n_workers if n_workers and n_workers > 0 else 1
+    if pool_processes == 1:
+        for task_args in tasks: 
+            seq = normalize_sequence_task(task_args)
+            if seq is not None: normalized_sequences.append(seq)
+    else:
+        with Pool(processes=pool_processes) as p: # Use multiprocessing.Pool
+            results = list(p.imap(normalize_sequence_task, tasks, chunksize=max(1, len(tasks)//(pool_processes*4)))) 
+            normalized_sequences = [seq for seq in results if seq is not None]
+    if not normalized_sequences: return
     random.shuffle(normalized_sequences)
     total = len(normalized_sequences)
     ntr   = int(train_r * total); nvl   = int(val_r   * total)
-    splits = {"train": normalized_sequences[:ntr], 
-              "val":   normalized_sequences[ntr:ntr+nvl], 
-              "test":  normalized_sequences[ntr+nvl:]}
+    splits = {"train": normalized_sequences[:ntr], "val":   normalized_sequences[ntr:ntr+nvl], "test":  normalized_sequences[ntr+nvl:]}
     for sp, seqs_in_split in splits.items():
         if not seqs_in_split: continue
         out_path = os.path.join(vec_base, sp, f"{cat_name}.npy")
         np.save(out_path, np.array(seqs_in_split, dtype=object))
 
-def run_pass2_for_category(cat_name, vec_base, ras_base, img_size, n_workers_ignored):
+def run_pass2_for_category(cat_name, vec_base, ras_base, img_size, n_workers):
     for sp in ("train","val","test"):
         vec_path = os.path.join(vec_base, sp, f"{cat_name}.npy")
         out_dir  = os.path.join(ras_base, sp, cat_name) 
@@ -241,35 +243,58 @@ def run_pass2_for_category(cat_name, vec_base, ras_base, img_size, n_workers_ign
         try:
             existing_indices = {int(fn.split("_")[1].split(".")[0]) for fn in os.listdir(out_dir) if fn.startswith("sketch_") and fn.endswith(".png")}
         except FileNotFoundError: pass
-        # Sequential processing
-        for idx, seq in enumerate(sequences_to_rasterize):
-            if idx not in existing_indices:
-                _rasterize_save_task((idx, seq, out_dir, img_size))
+        tasks = [(idx, seq, out_dir, img_size) for idx, seq in enumerate(sequences_to_rasterize) if idx not in existing_indices]
+        if not tasks: continue
+        pool_processes = n_workers if n_workers and n_workers > 0 else 1
+        if pool_processes == 1:
+            for task_args in tasks: _rasterize_save_task(task_args)
+        else:
+            with Pool(processes=pool_processes) as p: # Use multiprocessing.Pool
+                list(p.imap_unordered(_rasterize_save_task, tasks, chunksize=max(1, len(tasks)//(pool_processes*4)))) 
     
 def process_category_task(args_bundle):
-    cat_name, raw_sketches_5_element_for_cat, vec_base, ras_base, std_dev, train_r, val_r, _, img_size, progress_dict_cat = args_bundle
+    # Unpack arguments
+    cat_name, npz_file_path_for_cat, vec_base, ras_base, std_dev, train_r, val_r, n_workers, img_size, max_items_cat, progress_dict_cat = args_bundle
+    
     current_progress = progress_dict_cat.get(cat_name, {})
     try:
+        # Load sketches for this category first
+        # print(f"[Worker {os.getpid()}] Loading NPZ for {cat_name} from {npz_file_path_for_cat}")
+        raw_sketches_5_element_for_cat = load_sketches_from_npz(npz_file_path_for_cat, max_items_cat)
+        if not raw_sketches_5_element_for_cat:
+            print(f"Warning: No sketches loaded for {cat_name} in worker. Skipping.")
+            current_progress["pass1_done"] = True # Mark as done to avoid re-processing empty
+            current_progress["pass2_done"] = True
+            return cat_name, current_progress, "No sketches loaded"
+
         if not current_progress.get("pass1_done", False):
-            run_pass1_for_category(cat_name, raw_sketches_5_element_for_cat, vec_base, std_dev, train_r, val_r, 1) # n_workers set to 1 (ignored)
+            # print(f"[Worker {os.getpid()}] Running Pass 1 for {cat_name}")
+            run_pass1_for_category(cat_name, raw_sketches_5_element_for_cat, vec_base, std_dev, train_r, val_r, n_workers) 
             current_progress["pass1_done"] = True
+        
         if not current_progress.get("pass2_done", False): 
-            run_pass2_for_category(cat_name, vec_base, ras_base, img_size, 1) # n_workers set to 1 (ignored)
+            # print(f"[Worker {os.getpid()}] Running Pass 2 for {cat_name}")
+            run_pass2_for_category(cat_name, vec_base, ras_base, img_size, n_workers)
             current_progress["pass2_done"] = True
         return cat_name, current_progress, None 
     except Exception as e:
         print(f"!!! Error processing category {cat_name} in worker {os.getpid()}: {e}")
+        traceback.print_exc() # Print full traceback from worker
         return cat_name, current_progress, str(e) 
 
 _cat_slots_stats = {} 
 def init_stats_worker(cat_slots_arg): global _cat_slots_stats; _cat_slots_stats = cat_slots_arg
+
 def stats_for_category_task(args_tuple):
-    category_name, sketch_sequences_from_npz, max_items = args_tuple 
+    category_name, raw_npz_file_path, max_items = args_tuple # Changed from sketch_sequences to file_path
+    
+    # Load sketches inside the worker for this category
+    sketch_sequences_from_npz = load_sketches_from_npz(raw_npz_file_path, max_items)
+    if not sketch_sequences_from_npz:
+        return category_name, 0.0, 0.0, 0.0 # Return zero stats if no sketches
+
     n_category, mean_category, M2_category = 0.0, 0.0, 0.0
-    sketches_to_process = sketch_sequences_from_npz 
-    if max_items is not None and len(sketches_to_process) > max_items:
-        sketches_to_process = sketches_to_process[:max_items]
-    for delta_sequence in sketches_to_process: 
+    for delta_sequence in sketch_sequences_from_npz: 
         if delta_sequence.size > 0 and delta_sequence.ndim == 2 and delta_sequence.shape[1] == 5:
             deltas_for_std = np.concatenate((delta_sequence[:, 0], delta_sequence[:, 1]))
             for x_val in deltas_for_std:
@@ -301,8 +326,7 @@ def main():
     parser.add_argument("--processed_dir", default=PROCESSED_DATA_DIR)
     parser.add_argument("--train_ratio", type=float, default=TRAIN_RATIO)
     parser.add_argument("--val_ratio",   type=float, default=VAL_RATIO)
-    parser.add_argument("--threads", type=int, default=min(os.cpu_count() if os.cpu_count() else 1, 8),
-                        help="Number of threads/processes for parallel tasks (downloads, stats, CATEGORY processing).")
+    parser.add_argument("--threads", type=int, default=min(os.cpu_count() if os.cpu_count() else 1, 8))
     parser.add_argument("--max_items_per_category", type=int, default=None)
     args = parser.parse_args()
 
@@ -348,19 +372,8 @@ def main():
         print(f"Proceeding with {len(target_categories)} categories with raw data.")
         if args.step == "download": return
 
-    all_sketches_by_cat_npz = {} 
-    if args.step in ("stats", "process", "all"):
-        print("\n--- Loading all sketches from NPZ files (will convert to 5-element) ---")
-        for cat_name in tqdm(target_categories, desc="Loading NPZ data"):
-            npz_file_path = os.path.join(args.raw_dir, f"{cat_name}.npz")
-            if os.path.exists(npz_file_path):
-                sketches = load_sketches_from_npz(npz_file_path, args.max_items_per_category)
-                if sketches: all_sketches_by_cat_npz[cat_name] = sketches
-            else: print(f"Warning: NPZ file for {cat_name} not found. Skipping.")
-        if not all_sketches_by_cat_npz: print("No sketches loaded. Exiting."); return
-        target_categories = sorted(all_sketches_by_cat_npz.keys()) 
-        if not target_categories: print("No categories with loaded sketches. Exiting."); return
-        print(f"Successfully loaded and converted sketches for {len(target_categories)} categories.")
+    # Removed pre-loading of all_sketches_by_cat_npz here.
+    # Data will be loaded on-demand by worker processes in stats and process stages.
 
     global_std_dev = 1.0
     if args.step in ("stats","all"):
@@ -371,24 +384,31 @@ def main():
                 with open(stats_progress_file, "r") as f: stats_progress = json.load(f)
                 print(f"Loaded stats progress for {len(stats_progress)} categories.")
             except json.JSONDecodeError: print(f"Warning: Could not parse {stats_progress_file}.")
-        categories_for_stats = [cat for cat in target_categories if cat not in stats_progress and cat in all_sketches_by_cat_npz]
+        
+        categories_for_stats = [cat for cat in target_categories if cat not in stats_progress]
+        
         if not categories_for_stats:
-            print("→ Stats already computed for all target categories with loaded data.")
+            print("→ Stats already computed for all target categories.")
             if os.path.exists(main_config_file):
                 with open(main_config_file, "r") as f: cfg = json.load(f)
                 global_std_dev = cfg.get("quickdraw_std_dev", 1.0)
             else: print("Warning: Main config not found, std_dev might be default.")
         else:
             print(f"Calculating stats for {len(categories_for_stats)} new/remaining categories...")
-            stats_tasks = [(cat, all_sketches_by_cat_npz[cat], args.max_items_per_category) for cat in categories_for_stats]
-            if not stats_tasks: print("No data for categories needing stats.")
+            # Each task now includes the NPZ file path for on-demand loading in the worker
+            stats_tasks = [(cat, os.path.join(args.raw_dir, f"{cat}.npz"), args.max_items_per_category) 
+                           for cat in categories_for_stats
+                           if os.path.exists(os.path.join(args.raw_dir, f"{cat}.npz"))] 
+            
+            if not stats_tasks:
+                print("No valid NPZ files found for categories needing stats. Skipping stats calculation.")
             else:
-                # Corrected: Now Pool is imported from multiprocessing
-                with Pool(processes=args.threads) as pool: 
+                with Pool(processes=args.threads) as pool: # multiprocessing.Pool
                     results_iterator = pool.imap(stats_for_category_task, stats_tasks)
                     for cat_name, n_cat, mean_cat, M2_cat in tqdm(results_iterator, total=len(stats_tasks), desc="Stats Calculation"):
                         stats_progress[cat_name] = [float(n_cat), float(mean_cat), float(M2_cat)]
                         with open(stats_progress_file, "w") as f: json.dump(stats_progress, f, indent=2)
+            
             all_cat_stats_for_merge = [stats_progress[cat] for cat in target_categories if cat in stats_progress]
             if not all_cat_stats_for_merge: print("No stats to compute global std_dev.")
             else:
@@ -433,16 +453,17 @@ def main():
 
         tasks_for_processing_stage = []
         for cat_name in categories_for_processing:
-            if cat_name not in all_sketches_by_cat_npz: 
-                print(f"Warning: No loaded sketch data for {cat_name}, skipping process stage for it.")
+            npz_file_path_for_cat = os.path.join(args.raw_dir, f"{cat_name}.npz")
+            if not os.path.exists(npz_file_path_for_cat):
+                print(f"Warning: NPZ file for {cat_name} not found at {npz_file_path_for_cat}, skipping process stage for it.")
                 continue
             cat_prog = process_progress.get(cat_name, {})
             if not cat_prog.get("pass1_done", False) or not cat_prog.get("pass2_done", False): 
                 tasks_for_processing_stage.append(
-                    (cat_name, all_sketches_by_cat_npz[cat_name], 
+                    (cat_name, npz_file_path_for_cat, # Pass NPZ file path instead of loaded sketches
                      vector_output_base, raster_output_base, 
                      global_std_dev, args.train_ratio, args.val_ratio, 
-                     args.threads, RASTER_IMG_SIZE, process_progress) 
+                     args.threads, RASTER_IMG_SIZE, args.max_items_per_category, process_progress) 
                 )
         
         if not tasks_for_processing_stage:
