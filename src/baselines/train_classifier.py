@@ -240,7 +240,9 @@ def main(a):
     cfgp = os.path.join(root, f"{a.dataset_name}_vector", a.config_filename)
     if a.debug_num_classes and a.debug_num_classes > 0:
         config = json.load(open(cfgp))
-        config["category_map"] = dict(list(config["category_map"].items())[:a.debug_num_classes])
+        # only iterate and map first N categories
+         config["categories_processed"] = list(config["category_map"].keys())[:a.debug_num_classes]
+         config["category_map"] = {cat: idx for idx, cat in enumerate(config["categories_processed"])}
         tmp_cfg = os.path.join(SCRIPT_DIR, f"debug_{a.config_filename}")
         with open(tmp_cfg, "w") as f:
             json.dump(config, f)
