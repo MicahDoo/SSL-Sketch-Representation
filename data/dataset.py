@@ -22,6 +22,8 @@ class SketchDataset(Dataset):
                  on_the_fly_raster_padding_percent=DEFAULT_RASTER_PADDING_PERCENT,
                  num_initial_load_workers=4 # New parameter for parallel loading
                 ):
+        self._load_data()
+        self.num_classes = len(self.category_map)
         self.dataset_root_path = dataset_path
         self.dataset_name_base = dataset_name.lower()
         self.split = split
