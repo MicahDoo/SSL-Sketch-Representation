@@ -257,7 +257,7 @@ def main(a):
 
 
     # ── Model ───────────────────────────────────────────────────────────
-    model = SketchClassifier(ncls, in_ch, in_ch==3 and a.use_pretrained, a.freeze_backbone)
+    model = SketchClassifier(trds.num_classes, in_ch, in_ch==3 and a.use_pretrained, a.freeze_backbone)
     model = model.to(device, memory_format=torch.channels_last)
     if torch.__version__.startswith("2") and a.torch_compile:
         model = torch.compile(model, mode="max-autotune")
