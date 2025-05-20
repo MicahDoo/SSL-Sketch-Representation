@@ -263,7 +263,10 @@ def main(a):
                       pin_memory=True)
 
     # ── Number of classes ───────────────────────────────────────────────
-    if a.num_classes:
+    # If we're in debug mode, override the head size too:
+    if a.debug_num_classes and a.debug_num_classes > 0:
+        ncls = a.debug_num_classes
+    elif a.num_classes:
         ncls = a.num_classes
     elif hasattr(trds, 'num_classes') and trds.num_classes:
         ncls = trds.num_classes
@@ -273,6 +276,7 @@ def main(a):
             ncls = len(json.load(open(cfgp))["category_map"])
         else:
             raise ValueError("Could not infer num_classes. Provide --num_classes or a config with category_map.")
+
 
     # ── Model ───────────────────────────────────────────────────────────
     model = SketchClassifier(ncls, in_ch, in_ch==3 and a.use_pretrained, a.freeze_backbone)
