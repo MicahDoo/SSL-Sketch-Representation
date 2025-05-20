@@ -113,10 +113,13 @@ def train_validate(model, train_ld, val_ld, crit, opt, sched, epochs, device,
     os.makedirs(ckpt_dir, exist_ok=True)
     latest = os.path.join(ckpt_dir, f"{exp}_latest_checkpoint.pth")
 
-    # GradScaler shim (PyTorch 1.12 → 2.2)
+        # ── GradScaler shim ─────────────────────────────────────────────
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
         Scaler = torch.amp.GradScaler
-        scaler = Scaler(enabled=amp_flag and device.type == "cuda", device_type=device.type)
+        if device.type == "cuda" and amp_flag:
+            scaler = Scaler(enabled=True)  # defaults to CUDA
+        else:
+            scaler = Scaler(enabled=False)  # AMP off on unsupported device
     else:  # legacy fallback
         from torch.cuda.amp import GradScaler as Scaler
         scaler = Scaler(enabled=amp_flag and device.type == "cuda")
