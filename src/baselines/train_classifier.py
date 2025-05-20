@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
 """
-train_classifier_optimized.py (v5 – complete)
+train_classifier_optimized.py (v5 – complete with debug mode)
 ---------------------------------------------
-Fully optimized ResNet‑50 sketch classifier training script with:
-• cuDNN autotune + channels‑last tensors
+Fully optimized ResNet-50 sketch classifier training script with:
+• cuDNN autotune + channels-last tensors
 • AMP (FP16) or BF16 with GradScaler shim (PyTorch 1.12 → 2.2)
-• Optional `torch.compile` for fused kernels on PyTorch ≥ 2.0
-• Beefed‑up DataLoader (persistent workers, prefetch)
-• Single‑pass profiler (first 4 batches)
-• Robust checkpoint resume / best‑model copy
+• Optional `torch.compile` for fused kernels on PyTorch ≥ 2.0
+• Beefed-up DataLoader (persistent workers, prefetch)
+• Single-pass profiler (first 4 batches)
+• Robust checkpoint resume / best-model copy
+• Debug mode: restrict to first N classes for quick smoke tests
 
-Drop‑in replacement for the original `train_classifier.py` – same CLI flags.
+Drop-in replacement for the original `train_classifier.py` – same CLI flags,
+plus `--debug_num_classes`.
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 🔧  Global switches
 # ──────────────────────────────────────────────────────────────────────────────
-import os, sys, json, argparse, shutil, torch
+import os
+import sys
+import json
+import argparse
+import shutil
+import torch
 from torch import nn, optim, autocast
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -77,7 +84,6 @@ class SketchClassifier(nn.Module):
 # ──────────────────────────────────────────────────────────────────────────────
 # 💾  Checkpoint helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
 def save_ckpt(epoch, model, opt, sched, hist, best, path, best_tag=False):
     torch.save({
         "epoch": epoch + 1,
@@ -89,7 +95,6 @@ def save_ckpt(epoch, model, opt, sched, hist, best, path, best_tag=False):
     }, path)
     if best_tag:
         shutil.copyfile(path, path.replace("_latest_checkpoint", "_best_model"))
-
 
 def load_ckpt(model, opt, sched, path, device):
     if not os.path.exists(path):
@@ -105,7 +110,6 @@ def load_ckpt(model, opt, sched, path, device):
 # ──────────────────────────────────────────────────────────────────────────────
 # 🚂  Training / validation
 # ──────────────────────────────────────────────────────────────────────────────
-
 def train_validate(model, train_ld, val_ld, crit, opt, sched, epochs, device,
                    exp="Run", amp_flag=False, ckpt_dir="ckpts", save_every=1,
                    start_ep=0, hist=None, best_acc=0.0, profile=False):
@@ -113,14 +117,14 @@ def train_validate(model, train_ld, val_ld, crit, opt, sched, epochs, device,
     os.makedirs(ckpt_dir, exist_ok=True)
     latest = os.path.join(ckpt_dir, f"{exp}_latest_checkpoint.pth")
 
-        # ── GradScaler shim ─────────────────────────────────────────────
+    # ── GradScaler shim ─────────────────────────────────────────────
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
         Scaler = torch.amp.GradScaler
         if device.type == "cuda" and amp_flag:
-            scaler = Scaler(enabled=True)  # defaults to CUDA
+            scaler = Scaler(enabled=True)
         else:
-            scaler = Scaler(enabled=False)  # AMP off on unsupported device
-    else:  # legacy fallback
+            scaler = Scaler(enabled=False)
+    else:
         from torch.cuda.amp import GradScaler as Scaler
         scaler = Scaler(enabled=amp_flag and device.type == "cuda")
 
@@ -158,7 +162,13 @@ def train_validate(model, train_ld, val_ld, crit, opt, sched, epochs, device,
     for ep in range(start_ep, epochs):
         ei = ep + 1
         model.train(); tloss = tcorrect = ttotal = 0
-        pbar = tqdm(train_ld, desc=f"Ep {ei}/{epochs} [train]", leave=False)
+        pbar = tqdm(
+            train_ld,
+            desc=f"Ep {ei}/{epochs} [train]",
+            leave=True,
+            disable=False,
+            file=sys.stderr,
+        )
 
         # optional profiler block
         if prof and ep == start_ep:
@@ -167,8 +177,8 @@ def train_validate(model, train_ld, val_ld, crit, opt, sched, epochs, device,
                     l, c, n = train_step(batch)
                     tloss += l * n; tcorrect += c; ttotal += n
                     prof.step()
-                    if i >= 4: break  # 1 warm‑up + 3 active
-            for batch in pbar:  # remainder
+                    if i >= 4: break
+            for batch in pbar:
                 l, c, n = train_step(batch)
                 tloss += l * n; tcorrect += c; ttotal += n
         else:
@@ -209,9 +219,8 @@ def train_validate(model, train_ld, val_ld, crit, opt, sched, epochs, device,
 # ──────────────────────────────────────────────────────────────────────────────
 # 🚀  Main
 # ──────────────────────────────────────────────────────────────────────────────
-
 def main(a):
-    """Entry point built to be CLI‑friendly."""
+    """Entry point built to be CLI-friendly."""
     device = torch.device(f"cuda:{a.gpu_id}" if a.use_gpu and torch.cuda.is_available() else "cpu")
     print("Device:", device)
 
@@ -233,6 +242,16 @@ def main(a):
     vlds = SketchDataset(root, a.dataset_name, split=a.val_split, image_size=a.img_size,
                          max_seq_len=a.max_seq_len, config_filename=a.config_filename,
                          raster_transform=tf)
+
+    # ── Debug: restrict to first N classes ───────────────────────────────
+    if a.debug_num_classes and a.debug_num_classes > 0:
+        max_c = a.debug_num_classes
+        tr_idxs = [i for i in range(len(trds)) if trds[i]['label'].item() < max_c]
+        val_idxs = [i for i in range(len(vlds)) if vlds[i]['label'].item() < max_c]
+        print(f"🛠 Debug mode: restricting to first {max_c} classes → "
+              f"{len(tr_idxs)} train / {len(val_idxs)} val samples")
+        trds = Subset(trds, tr_idxs)
+        vlds = Subset(vlds, val_idxs)
 
     trld = DataLoader(trds, batch_size=a.batch_size, shuffle=True,
                       num_workers=a.num_workers or DEFAULT_WORKERS,
@@ -281,36 +300,39 @@ def main(a):
                    amp_flag=a.use_amp, ckpt_dir=ckpt_dir, save_every=a.save_every,
                    start_ep=start_ep, hist=hist, best_acc=best, profile=a.profile)
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # 🛠️  CLI
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    p = argparse.ArgumentParser("Train ResNet‑50 sketch classifier (optimized)")
-    p.add_argument('--dataset_root', default=DEFAULT_ROOT)
-    p.add_argument('--dataset_name', default=DEFAULT_NAME)
-    p.add_argument('--config_filename', default=DEFAULT_CFG)
-    p.add_argument('--train_split', default='train')
-    p.add_argument('--val_split',   default='val')
-    p.add_argument('--img_size', type=int, default=DEFAULT_IMG_SIZE)
-    p.add_argument('--max_seq_len', type=int, default=70)
-    p.add_argument('--num_classes', type=int)
+    p = argparse.ArgumentParser("Train ResNet-50 sketch classifier (optimized)")
+    p.add_argument('--dataset_root',   default=DEFAULT_ROOT)
+    p.add_argument('--dataset_name',   default=DEFAULT_NAME)
+    p.add_argument('--config_filename',default=DEFAULT_CFG)
+    p.add_argument('--train_split',    default='train')
+    p.add_argument('--val_split',      default='val')
+    p.add_argument('--img_size',       type=int,   default=DEFAULT_IMG_SIZE)
+    p.add_argument('--max_seq_len',    type=int,   default=70)
+    p.add_argument('--num_classes',    type=int)
     p.add_argument('--use_pretrained', action='store_true')
-    p.add_argument('--freeze_backbone', action='store_true')
-    p.add_argument('--epochs', type=int, default=20)
-    p.add_argument('--batch_size', type=int, default=512)
-    p.add_argument('--lr', type=float, default=1e-3)
-    p.add_argument('--weight_decay', type=float, default=1e-4)
-    p.add_argument('--lr_patience', type=int, default=3)
-    p.add_argument('--num_workers', type=int)
-    p.add_argument('--use_gpu', action='store_true')
-    p.add_argument('--gpu_id', type=int, default=0)
-    p.add_argument('--use_amp', action='store_true')
-    p.add_argument('--torch_compile', action='store_true')
+    p.add_argument('--freeze_backbone',action='store_true')
+    p.add_argument('--epochs',         type=int,   default=20)
+    p.add_argument('--batch_size',     type=int,   default=512)
+    p.add_argument('--lr',             type=float, default=1e-3)
+    p.add_argument('--weight_decay',   type=float, default=1e-4)
+    p.add_argument('--lr_patience',    type=int,   default=3)
+    p.add_argument('--num_workers',    type=int)
+    p.add_argument('--use_gpu',        action='store_true')
+    p.add_argument('--gpu_id',         type=int,   default=0)
+    p.add_argument('--use_amp',        action='store_true')
+    p.add_argument('--torch_compile',  action='store_true')
     p.add_argument('--checkpoint_dir', default=DEFAULT_CKPT_DIR)
-    p.add_argument('--resume', action='store_true')
-    p.add_argument('--save_every', type=int, default=1)
-    p.add_argument('--profile', action='store_true')
-    p.add_argument('--experiment_name', default='ResNetClassify')
-
+    p.add_argument('--resume',         action='store_true')
+    p.add_argument('--save_every',     type=int,   default=1)
+    p.add_argument('--profile',        action='store_true')
+    p.add_argument(
+        '--debug_num_classes',
+        type=int,
+        default=0,
+        help="If >0, only load samples with label < this (for quick debug)"
+    )
     main(p.parse_args())
