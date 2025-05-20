@@ -15,14 +15,16 @@ DEFAULT_RASTER_PADDING_PERCENT = 0.02
 
 class SketchDataset(Dataset):
     def __init__(self, dataset_path, dataset_name="quickdraw", split="train",
-                 max_seq_len=MAX_SEQ_LEN, image_size=IMG_SIZE,
-                 vector_transform=None, raster_transform=None,
+                 max_seq_len=MAX_SEQ_LEN, 
+                 image_size=IMG_SIZE,
+                 vector_transform=None, 
+                 raster_transform=None,
                  config_filename="quickdraw_config.json", 
                  raster_data_subdir="quickdraw_raster", 
                  on_the_fly_raster_padding_percent=DEFAULT_RASTER_PADDING_PERCENT,
                  num_initial_load_workers=4 # New parameter for parallel loading
+                 max_categories=None           # Limit number of categories for debugging
                 ):
-        self.num_classes = len(self.category_map)
         self.dataset_root_path = dataset_path
         self.dataset_name_base = dataset_name.lower()
         self.split = split
@@ -32,6 +34,7 @@ class SketchDataset(Dataset):
         self.raster_transform = raster_transform
         self.on_the_fly_raster_padding_percent = on_the_fly_raster_padding_percent
         self.num_initial_load_workers = max(1, num_initial_load_workers) # Ensure at least 1 worker
+        self.max_categories = max_categories
 
         self.vector_data_root = os.path.join(self.dataset_root_path, f"{self.dataset_name_base}_vector")
         self.raster_data_root = os.path.join(self.dataset_root_path, raster_data_subdir)
@@ -132,6 +135,10 @@ class SketchDataset(Dataset):
         else: # Config doesn't have 'categories_processed' or it's None
             categories_to_iterate = categories_in_split_from_fs
         
+        # --- Debugging: limit number of categories if requested ---
+        if self.max_categories is not None:
+            categories_to_iterate = categories_to_iterate[: self.max_categories]
+
         if not self.category_map and categories_to_iterate: 
             print("DEBUG [SketchDataset._load_data]: Building temporary category_map from directory listing as config map was empty/missing.")
             for i, cat_name in enumerate(categories_to_iterate):

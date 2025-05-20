@@ -252,14 +252,14 @@ def main(a):
 
     trds = SketchDataset(root, a.dataset_name, split=a.train_split, image_size=a.img_size,
                          max_seq_len=a.max_seq_len, config_filename=cfg_file,
-                         raster_transform=tf)
+                         raster_transform=tf, max_categories=(a.debug_num_classes or None))
     vlds = SketchDataset(root, a.dataset_name, split=a.val_split, image_size=a.img_size,
                          max_seq_len=a.max_seq_len, config_filename=cfg_file,
-                         raster_transform=tf)
+                         raster_transform=tf, max_categories=(a.debug_num_classes or None))
 
 
     # ── Model ───────────────────────────────────────────────────────────
-    model = SketchClassifier(trds.num_classes, in_ch, in_ch==3 and a.use_pretrained, a.freeze_backbone)
+    model = SketchClassifier(len(trds.category_map), in_ch, in_ch==3 and a.use_pretrained, a.freeze_backbone)
     model = model.to(device, memory_format=torch.channels_last)
     if torch.__version__.startswith("2") and a.torch_compile:
         model = torch.compile(model, mode="max-autotune")
