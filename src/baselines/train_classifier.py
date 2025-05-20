@@ -236,46 +236,24 @@ def main(a):
 
     # ── Datasets & loaders ──────────────────────────────────────────────
     root = os.path.abspath(a.dataset_root)
+    # Debug: truncate category_map in the config before loading the dataset
+    cfgp = os.path.join(root, f"{a.dataset_name}_vector", a.config_filename)
+    if a.debug_num_classes and a.debug_num_classes > 0:
+        config = json.load(open(cfgp))
+        config["category_map"] = dict(list(config["category_map"].items())[:a.debug_num_classes])
+        tmp_cfg = os.path.join(SCRIPT_DIR, f"debug_{a.config_filename}")
+        with open(tmp_cfg, "w") as f:
+            json.dump(config, f)
+        cfg_file = tmp_cfg
+    else:
+        cfg_file = a.config_filename
+
     trds = SketchDataset(root, a.dataset_name, split=a.train_split, image_size=a.img_size,
-                         max_seq_len=a.max_seq_len, config_filename=a.config_filename,
+                         max_seq_len=a.max_seq_len, config_filename=cfg_file,
                          raster_transform=tf)
     vlds = SketchDataset(root, a.dataset_name, split=a.val_split, image_size=a.img_size,
-                         max_seq_len=a.max_seq_len, config_filename=a.config_filename,
+                         max_seq_len=a.max_seq_len, config_filename=cfg_file,
                          raster_transform=tf)
-
-    # ── Debug: restrict to first N classes ───────────────────────────────
-    if a.debug_num_classes and a.debug_num_classes > 0:
-        max_c = a.debug_num_classes
-        tr_idxs = [i for i in range(len(trds)) if trds[i]['label'].item() < max_c]
-        val_idxs = [i for i in range(len(vlds)) if vlds[i]['label'].item() < max_c]
-        print(f"🛠 Debug mode: restricting to first {max_c} classes → "
-              f"{len(tr_idxs)} train / {len(val_idxs)} val samples")
-        trds = Subset(trds, tr_idxs)
-        vlds = Subset(vlds, val_idxs)
-
-    trld = DataLoader(trds, batch_size=a.batch_size, shuffle=True,
-                      num_workers=a.num_workers or DEFAULT_WORKERS,
-                      prefetch_factor=DEFAULT_PREFETCH, persistent_workers=True,
-                      pin_memory=True)
-    vld  = DataLoader(vlds, batch_size=a.batch_size, shuffle=False,
-                      num_workers=a.num_workers or DEFAULT_WORKERS,
-                      prefetch_factor=DEFAULT_PREFETCH, persistent_workers=True,
-                      pin_memory=True)
-
-    # ── Number of classes ───────────────────────────────────────────────
-    # If we're in debug mode, override the head size too:
-    if a.debug_num_classes and a.debug_num_classes > 0:
-        ncls = a.debug_num_classes
-    elif a.num_classes:
-        ncls = a.num_classes
-    elif hasattr(trds, 'num_classes') and trds.num_classes:
-        ncls = trds.num_classes
-    else:
-        cfgp = os.path.join(root, f"{a.dataset_name}_vector", a.config_filename)
-        if os.path.exists(cfgp):
-            ncls = len(json.load(open(cfgp))["category_map"])
-        else:
-            raise ValueError("Could not infer num_classes. Provide --num_classes or a config with category_map.")
 
 
     # ── Model ───────────────────────────────────────────────────────────
