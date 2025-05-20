@@ -95,7 +95,11 @@ def train_validate(model, train_ld, val_ld, crit, opt, sched, epochs, device,
         scaler = Scaler(enabled=(device.type == "cuda" and amp_flag))
 
     def prep(batch):
-        x = batch["raster_image"].to(device, non_blocking=True).to(memory_format=torch.channels_last)
+        x = batch["raster_image"].to(device, non_blocking=True)
+        # ensure 4D for channels_last
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        x = x.to(memory_format=torch.channels_last)
         y = batch["label"].to(device, non_blocking=True)
         return x, y
 
@@ -226,6 +230,26 @@ def main(a):
         max_categories=(a.debug_num_classes or None)
     )
 
+    # Wrap in DataLoader
+    train_ld = DataLoader(
+        trds,
+        batch_size=a.batch_size,
+        shuffle=True,
+        num_workers=a.num_workers or DEFAULT_WORKERS,
+        pin_memory=a.use_gpu,
+        persistent_workers=True,
+        prefetch_factor=DEFAULT_PREFETCH
+    )
+    val_ld = DataLoader(
+        vlds,
+        batch_size=a.batch_size,
+        shuffle=False,
+        num_workers=a.num_workers or DEFAULT_WORKERS,
+        pin_memory=a.use_gpu,
+        persistent_workers=True,
+        prefetch_factor=DEFAULT_PREFETCH
+    )
+
     # Model setup
     class SketchClassifier(nn.Module):
         def __init__(self, num_classes, in_ch=1, pretrained=False, freeze=False):
@@ -269,7 +293,7 @@ def main(a):
 
     # Train!
     train_validate(
-        model, trds, vlds,
+        model, train_ld, val_ld,
         criterion, optimizer, scheduler,
         epochs=a.epochs,
         device=device,
