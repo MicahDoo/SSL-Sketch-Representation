@@ -22,7 +22,7 @@ class SketchDataset(Dataset):
                  config_filename="quickdraw_config.json", 
                  raster_data_subdir="quickdraw_raster", 
                  on_the_fly_raster_padding_percent=DEFAULT_RASTER_PADDING_PERCENT,
-                 num_initial_load_workers=4 # New parameter for parallel loading
+                 num_initial_load_workers=4, # New parameter for parallel loading
                  max_categories=None           # Limit number of categories for debugging
                 ):
         self.dataset_root_path = dataset_path
