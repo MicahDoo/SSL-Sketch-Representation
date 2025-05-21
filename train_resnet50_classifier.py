@@ -29,7 +29,7 @@ if SRC_PATH not in sys.path:
 
 try:
     from backbones.resnet50 import ResNet50Backbone
-    from models.resnet50 import ResNet50Classifier
+    from models.resnet50_classifier import ResNet50Classifier
     from dataset import SketchDataset
 except ImportError as e:
     print(f"Error importing custom modules: {e}")
