@@ -13,9 +13,9 @@ from datetime import datetime # For unique filenames
 from tqdm import tqdm
 from torch.amp import GradScaler, autocast # For PyTorch versions < 1.10, use torch.cuda.amp
 import numpy as np
-import cv2  # for image preprocessing
 from PIL import Image  # for working with images
 from torch.utils.data import Dataset, DataLoader  # for custom datasets
+
 
 # --- Add project src to Python path ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -28,6 +28,7 @@ if SRC_PATH not in sys.path:
 try:
     from backbones.alexnet import AlexNetBackbone
     from models.alexnet_classifier import AlexNetClassifier
+    from dataset import SketchDataset
 except ImportError as e:
     print(f"Error importing custom modules: {e}")
     print(f"Current sys.path: {sys.path}")
@@ -112,70 +113,57 @@ def load_data(config, project_root_dir):
         ]),
     }
 
-    sketch_data_base_dir = os.path.join(project_root_dir, "processed_data", config.data_dir_name)
-    print(f"Attempting to load data from: {sketch_data_base_dir}")
+    # Root of both raster and vector dirs
+    sketch_data_root = os.path.join(project_root_dir, "processed_data")
 
     image_datasets = {}
     dataloaders = {}
     dataset_sizes = {}
     num_classes_inferred = config.num_classes
 
-    # Simply load datasets with transforms applied directly
     for split in ['train', 'val', 'test']:
-        data_dir_split = os.path.join(sketch_data_base_dir, split)
-        if not os.path.exists(data_dir_split):
-            print(f"Warning: Directory not found for {split} split: {data_dir_split}")
-            image_datasets[split] = None
+        # Instantiate SketchDataset in raster mode
+        ds = SketchDataset(
+            root_dir=sketch_data_root,
+            split=split,
+            mode='raster',
+            raster_transform=data_transforms[split]
+        )
+        image_datasets[split] = ds
+        if len(ds) == 0:
+            print(f"Warning: No samples found for {split} split.")
             dataloaders[split] = None
             dataset_sizes[split] = 0
             continue
-        
-        try:
-            # Apply transforms immediately - no caching
-            image_datasets[split] = datasets.ImageFolder(data_dir_split, transform=data_transforms[split])
-            
-            if split == 'train' and len(image_datasets[split]) > 0:
-                if num_classes_inferred is None:
-                    num_classes_inferred = len(image_datasets[split].classes)
-                    print(f"Inferred NUM_CLASSES = {num_classes_inferred} from training data.")
-                elif num_classes_inferred != len(image_datasets[split].classes):
-                    print(f"Warning: Provided num_classes ({config.num_classes}) differs from "
-                         f"classes found in training data ({len(image_datasets[split].classes)}). "
-                         f"Using inferred value: {len(image_datasets[split].classes)}")
-                    num_classes_inferred = len(image_datasets[split].classes)
-                    
-            # Create standard DataLoader without caching layers
-            dataloaders[split] = DataLoader(
-                image_datasets[split],
-                batch_size=config.batch_size,
-                shuffle=(split == 'train'),
-                num_workers=config.num_workers,
-                pin_memory=torch.cuda.is_available() and not config.no_cuda,
-                persistent_workers=True if config.num_workers > 0 else False,
-                prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None,
-                # multiprocessing_context='spawn' if config.num_workers > 0 else None,
-            )
-            
-            dataset_sizes[split] = len(image_datasets[split])
-            print(f"Created standard DataLoader for {split} split: {dataset_sizes[split]} samples")
-            
-        except Exception as e:
-            print(f"Error loading data for {split} split from {data_dir_split}: {e}")
-            image_datasets[split] = None
-            dataloaders[split] = None
-            dataset_sizes[split] = 0
 
-    if all(ds is None for ds in image_datasets.values()) or dataset_sizes.get('train', 0) == 0:
-        print("Critical Error: No training data was loaded."); sys.exit(1)
-    if num_classes_inferred is None:
-        print("Critical Error: Number of classes could not be determined."); sys.exit(1)
+        # Infer num classes on first non-empty split
+        if split == 'train':
+            inferred = len(ds.classes)
+            if num_classes_inferred is None:
+                num_classes_inferred = inferred
+                print(f"Inferred NUM_CLASSES = {num_classes_inferred} from training data.")
+            elif num_classes_inferred != inferred:
+                print(f"Warning: Provided num_classes ({num_classes_inferred}) != actual ({inferred})."
+                      f" Using actual.")
+                num_classes_inferred = inferred
 
-    print(f"\nData loading summary:\nNumber of classes: {num_classes_inferred}")
-    for split in ['train', 'val', 'test']:
-        loader = dataloaders.get(split)
-        print(f"{split.capitalize()} samples: {dataset_sizes.get(split, 0)}, " 
-              f"batches: {len(loader) if loader else 0}, "
-              f"workers: {config.num_workers if loader else 0}")
+        dataloaders[split] = DataLoader(
+            ds,
+            batch_size=config.batch_size,
+            shuffle=(split == 'train'),
+            num_workers=config.num_workers,
+            pin_memory=torch.cuda.is_available() and not config.no_cuda,
+            persistent_workers=(config.num_workers > 0),
+            prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None,
+        )
+        dataset_sizes[split] = len(ds)
+        print(f"Loaded {split}: {dataset_sizes[split]} samples, {len(dataloaders[split])} batches")
+
+    if num_classes_inferred is None or num_classes_inferred == 0:
+        print("Critical Error: Number of classes could not be determined.")
+        sys.exit(1)
+
+    print(f"\nData loading summary: {dataset_sizes}")
     return dataloaders, num_classes_inferred
 
 # --- Training Function ---
