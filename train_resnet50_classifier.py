@@ -44,7 +44,7 @@ def get_config():
     parser.add_argument('--input_image_height', type=int, default=224, help="Height of input images.")
     parser.add_argument('--input_image_width', type=int, default=224, help="Width of input images.")
     parser.add_argument('--num_input_channels', type=int, default=1, help="Number of input image channels (1 for grayscale).")
-    parser.add_argument('--batch_size', type=int, default=512, help="Batch size for training and evaluation.")
+    parser.add_argument('--batch_size', type=int, default=256, help="Batch size for training and evaluation.")
     parser.add_argument('--learning_rate', type=float, default=0.001, help="Learning rate for the optimizer.")
     parser.add_argument('--num_epochs', type=int, default=50, help="Number of training epochs.")
     parser.add_argument('--backbone_pretrained', type=lambda x: (str(x).lower() == 'true'),
