@@ -48,7 +48,7 @@ def get_config():
     parser.add_argument('--learning_rate', type=float, default=0.001, help="Learning rate for the optimizer.")
     parser.add_argument('--num_epochs', type=int, default=50, help="Number of training epochs.")
     parser.add_argument('--backbone_pretrained', type=lambda x: (str(x).lower() == 'true'),
-                        default=True, help="Load ImageNet-pretrained weights for backbone.")
+                        default=False, help="Load ImageNet-pretrained weights for backbone.")
     parser.add_argument('--dropout_prob', type=float, default=0.5, help="Dropout probability in the classifier.")
     parser.add_argument('--data_dir_name', type=str, default="quickdraw_raster",
                         help="Name of the data directory under processed_data.")
