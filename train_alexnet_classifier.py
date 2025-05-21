@@ -47,7 +47,7 @@ def get_config():
     parser.add_argument('--use_backbone_batch_norm', type=lambda x: (str(x).lower() == 'true'), default=True, help="Use BatchNorm in backbone.")
     parser.add_argument('--dropout_prob', type=float, default=0.5, help="Dropout probability in the classifier.")
     parser.add_argument('--data_dir_name', type=str, default="quickdraw_raster", help="Name of the data directory under processed_data.")
-    parser.add_argument('--num_workers', type=int, default=32, help="Number of workers for DataLoader.")
+    parser.add_argument('--num_workers', type=int, default=16, help="Number of workers for DataLoader.")
     parser.add_argument('--save_model_name_prefix', type=str, default="alexnet_quickdraw", help="Prefix for saving the trained model filename.")
     parser.add_argument('--history_log_name', type=str, default="training_history.json", help="Filename for saving the training history log.")
     parser.add_argument('--no_cuda', action='store_true', default=False, help='Disables CUDA training.')
