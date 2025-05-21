@@ -50,7 +50,6 @@ def get_config():
     parser.add_argument('--data_dir_name', type=str, default="quickdraw_raster", help="Name of the data directory under processed_data.")
     parser.add_argument('--num_workers', type=int, default=16, help="Number of workers for DataLoader.")
     parser.add_argument('--save_model_name_prefix', type=str, default="alexnet_quickdraw", help="Prefix for saving the trained model filename.")
-    parser.add_argument('--history_log_name', type=str, default="training_history.json", help="Filename for saving the training history log.")
     parser.add_argument('--no_cuda', action='store_true', default=False, help='Disables CUDA training.')
     parser.add_argument('--amp', action='store_true', default=True, help='Enables Automatic Mixed Precision (AMP) training.')
 
@@ -259,9 +258,8 @@ def main():
     unique_model_name = f"{config.save_model_name_prefix}_{timestamp}.pth"
     model_save_path = os.path.join(model_save_dir, unique_model_name)
     
-    # Adjust history log name to include timestamp if desired, or use as is
-    # For simplicity, using the provided name directly but placing in history_save_dir
-    history_log_path = os.path.join(history_save_dir, config.history_log_name)
+    history_log_name = f"{config.save_model_name_prefix}_{timestamp}.json"
+    history_log_path = os.path.join(history_save_dir, history_log_name)
     print(f"Training history will be saved to: {history_log_path}")
     print(f"Model will be saved to: {model_save_path}")
 

@@ -44,7 +44,7 @@ def get_config():
     parser.add_argument('--input_image_height', type=int, default=224, help="Height of input images.")
     parser.add_argument('--input_image_width', type=int, default=224, help="Width of input images.")
     parser.add_argument('--num_input_channels', type=int, default=1, help="Number of input image channels (1 for grayscale).")
-    parser.add_argument('--batch_size', type=int, default=2048, help="Batch size for training and evaluation.")
+    parser.add_argument('--batch_size', type=int, default=512, help="Batch size for training and evaluation.")
     parser.add_argument('--learning_rate', type=float, default=0.001, help="Learning rate for the optimizer.")
     parser.add_argument('--num_epochs', type=int, default=50, help="Number of training epochs.")
     parser.add_argument('--backbone_pretrained', type=lambda x: (str(x).lower() == 'true'),
@@ -55,8 +55,6 @@ def get_config():
     parser.add_argument('--num_workers', type=int, default=16, help="Number of workers for DataLoader.")
     parser.add_argument('--save_model_name_prefix', type=str,
                         default="resnet50_quickdraw", help="Prefix for saving the trained model filename.")
-    parser.add_argument('--history_log_name', type=str, default="training_history.json",
-                        help="Filename for saving the training history log.")
     parser.add_argument('--no_cuda', action='store_true', default=False, help='Disables CUDA training.')
     parser.add_argument('--amp', action='store_true', default=True, help='Enables Automatic Mixed Precision (AMP) training.')
 
@@ -202,8 +200,9 @@ def main():
     os.makedirs(history_dir, exist_ok=True)
 
     model_name = f"{config.save_model_name_prefix}_{timestamp}.pth"
+    history_log_name = f"{config.save_model_name_prefix}_{timestamp}.json"
     model_path = os.path.join(model_dir, model_name)
-    history_path = os.path.join(history_dir, config.history_log_name)
+    history_path = os.path.join(history_dir, history_log_name)
     print(f"Model will be saved to: {model_path}")
     print(f"History will be saved to: {history_path}")
 
