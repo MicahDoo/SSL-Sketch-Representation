@@ -20,3 +20,4 @@ processed_data/
 
 # Experiments - checkpoints and logs can be large
 experiments/
+checkpoints/
